@@ -4,7 +4,7 @@
 
 model:
   vocab_size:             32768
-  max_seq_len:            512
+  max_seq_len:            2048    # Updated for longer context
   hidden_dim:             512
   num_layers:             16
   num_heads:              8
@@ -38,9 +38,9 @@ training:
   warmup_steps:           200
 
   # Batch size
-  batch_size:             8       # real batch per step
-  grad_accumulation:      16      # effective batch = 128
-  max_seq_len:            512
+  batch_size:             4       # Reduced to 4 to prevent Memory Crash (OOM) at 2048 context
+  grad_accumulation:      32      # Increased to 32 to keep effective batch size at 128
+  max_seq_len:            2048    # Updated to match model sequence length
 
   # Loss weights
   lambda_mdm:             0.5     # MDM loss weight (phase 3)
@@ -58,12 +58,12 @@ training:
   checkpoint_dir:         ./checkpoints
 
 data:
-  train_path:             ./data/tinystories_train.npy
-  val_path:               ./data/tinystories_val.npy
+  train_path:             ./data/train.npy    # Updated to match FineWeb-Edu path
+  val_path:               ./data/val.npy      # Updated to match FineWeb-Edu path
   tokenizer:              gpt2
 
   # Pre-tokenization (run once)
-  dataset_name:           roneneldan/TinyStories
+  dataset_name:           HuggingFaceFW/fineweb-edu  # Updated for your educational dataset
   max_samples:            null    # null = use all
 
 diffusion:
@@ -86,3 +86,4 @@ cpu:
   float_precision:        medium  # float32 matmul precision
   pin_memory:             false
   num_workers:            0       # 0 for CPU (no multiprocessing overhead)
+  
