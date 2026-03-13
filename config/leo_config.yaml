@@ -3,73 +3,70 @@
 # All hyperparameters in one place.
 
 model:
-  vocab_size:             32768
-  max_seq_len:            2048    # Updated for longer context
+  vocab_size:             50260   # GPT-2 + 3 special tokens (PAD, MASK, IDK)
+  max_seq_len:            2048    # Long context — matches FineWeb-Edu article length
   hidden_dim:             512
   num_layers:             16
   num_heads:              8
-  num_kv_heads:           2       # GQA
-  num_ect:                4       # epistemic confidence tokens
-  ffn_dim:                null    # auto-computed: (8/3 * hidden_dim) → 1408
+  num_kv_heads:           2       # GQA — saves memory at 2048 context
+  num_ect:                4       # Epistemic Confidence Tokens
+  ffn_dim:                null    # Auto-computed: (8/3 * hidden_dim) = 1408
   gate_temperature:       1.0
   uncertainty_threshold:  0.35
   dropout:                0.0
   weight_tying:           true
-  pad_token_id:           0
-  mask_token_id:          1
-  idk_token_id:           2
+  pad_token_id:           50257
+  mask_token_id:          50258
+  idk_token_id:           50259
 
 training:
   # Phases
-  phase1_epochs:          3       # AR only
-  phase2_epochs:          3       # diffusion warmup (backbone frozen)
-  phase3_epochs:          6       # joint training
-  phase4_epochs:          1       # SFT
-  phase5_epochs:          1       # DPO
+  phase1_epochs:          3       # AR warmup only
+  phase2_epochs:          3       # Diffusion warmup (backbone frozen)
+  phase3_epochs:          6       # Full joint training
 
   # Optimizer
   optimizer:              adamw
   lr:                     3.0e-4
-  lr_min:                 3.0e-5  # cosine decay minimum
+  lr_min:                 3.0e-5  # Cosine decay floor
   weight_decay:           0.1
   beta1:                  0.9
   beta2:                  0.95
   grad_clip:              1.0
   warmup_steps:           200
 
-  # Batch size
-  batch_size:             4       # Reduced to 4 to prevent Memory Crash (OOM) at 2048 context
-  grad_accumulation:      32      # Increased to 32 to keep effective batch size at 128
-  max_seq_len:            2048    # Updated to match model sequence length
+  # Batch — tuned for T4 x2 GPU at 2048 context
+  batch_size:             4       # Reduced from 8 — prevents OOM at 2048 context
+  grad_accumulation:      32      # Increased from 16 — keeps effective batch at 128
+  max_seq_len:            2048    # Must match model.max_seq_len
 
   # Loss weights
   lambda_mdm:             0.5     # MDM loss weight (phase 3)
   lambda_ect:             0.1     # ECT calibration loss weight
-  lambda_const:           0.05    # constitutional loss weight
-  lambda_idk:             0.05    # IDK token loss weight (SFT only)
+  lambda_const:           0.05    # Constitutional loss weight
+  lambda_idk:             0.05    # IDK token loss weight
 
   # DPO
   dpo_beta:               0.1
   dpo_lambda_ect:         0.05
 
-  # Checkpointing
-  save_every_steps:       500
+  # Checkpointing — every 200 steps so session crashes lose minimal progress
+  save_every_steps:       200
   eval_every_steps:       250
   checkpoint_dir:         ./checkpoints
 
 data:
-  train_path:             ./data/train.npy    # Updated to match FineWeb-Edu path
-  val_path:               ./data/val.npy      # Updated to match FineWeb-Edu path
+  train_path:             ./data/train.npy
+  val_path:               ./data/val.npy
   tokenizer:              gpt2
-
-  # Pre-tokenization (run once)
-  dataset_name:           HuggingFaceFW/fineweb-edu  # Updated for your educational dataset
-  max_samples:            null    # null = use all
+  dataset_name:           HuggingFaceFW/fineweb-edu
+  max_tokens:             50000000  # 50M tokens streamed — fits Kaggle storage
+  max_doc_length:         2048      # Match model context — full articles
 
 diffusion:
-  num_steps:              16      # inference unmasking steps
+  num_steps:              16      # Inference unmasking steps
   schedule:               cosine
-  use_logit_normal:       true    # logit-normal timestep sampling
+  use_logit_normal:       true    # Logit-normal timestep sampling
   schedule_weight:        true    # SUBS weighting
 
 inference:
@@ -79,11 +76,9 @@ inference:
   consistency_votes:      3
   consistency_threshold:  0.70
 
-# Oracle A1 CPU optimizations
-cpu:
-  num_threads:            4
+# Kaggle GPU optimizations
+gpu:
   use_compile:            true    # torch.compile (PyTorch 2.x)
-  float_precision:        medium  # float32 matmul precision
-  pin_memory:             false
-  num_workers:            0       # 0 for CPU (no multiprocessing overhead)
-  
+  float_precision:        medium  # Faster matmul on T4
+  pin_memory:             true    # Faster CPU→GPU transfer
+  num_workers:            2       # Parallel data loading
