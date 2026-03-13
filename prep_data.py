@@ -69,7 +69,7 @@ else:
     all_tokens = []
     i = 0
     for item in ds:
-        ids = tok.encode(item["text"], truncation=False, max_length=1024)
+        ids = tok.encode(item["text"], truncation=False, max_length=2048)
         all_tokens.extend(ids)
         all_tokens.append(tok.eos_token_id)
         i += 1
