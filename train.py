@@ -324,7 +324,7 @@ def main():
     parser.add_argument("--batch_size", type=int, default=8)
     parser.add_argument("--grad_accum", type=int, default=16)
     parser.add_argument("--lr",         type=float, default=3e-4)
-    parser.add_argument("--save_every", type=int, default=500)
+    parser.add_argument("--save_every", type=int, default=200)
     args = parser.parse_args()
 
     device = torch.device("cpu")
