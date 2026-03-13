@@ -126,7 +126,7 @@ class DualPathAttention(nn.Module):
         self.W_O = nn.Linear(num_heads  * self.head_dim, hidden_dim,      bias=False)
 
         # Precompute RoPE tables — register as buffer (moves with .to(device))
-        cos, sin = precompute_rope_freqs(self.head_dim, max_seq_len)
+        cos, sin = precompute_rope_freqs(self.head_dim, max_seq_len + 16)
         self.register_buffer("rope_cos", cos)   # (max_seq_len, head_dim//2)
         self.register_buffer("rope_sin", sin)   # (max_seq_len, head_dim//2)
 
