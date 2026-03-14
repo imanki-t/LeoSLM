@@ -334,19 +334,39 @@ print()
 BOS_ID = tok.bos_token_id or 0
 EOS_ID = tok.eos_token_id or 1
 
-def stream_tokens(ds, max_tokens, source_name, max_doc_length=8192,
-                  text_fields=("text", "content", "code", "passage")):
+# ── Temporary binary file — tokens are written here in chunks (no RAM spike) ──
+TMP_BIN      = "data/tokens_tmp.bin"
+CHUNK_TOKENS = 250_000   # flush to disk every 250k tokens (1 MB of uint32)
+
+def stream_tokens_to_bin(ds, max_tokens, source_name, bin_f,
+                         max_doc_length=8192,
+                         text_fields=("text", "content", "code", "passage")):
     """
-    Stream + tokenize documents from HuggingFace dataset.
-    Uses LeoTokenizer. Adds BOS+EOS around each document.
-    Handles all text field names used across datasets.
+    Stream + tokenize documents from a HuggingFace dataset and write
+    directly to an open binary file in uint32 chunks.
+
+    NO in-memory list is built — each chunk is flushed to disk immediately,
+    bypassing the RAM bottleneck that caused the OOM kernel restart.
+
+    Returns:
+        int — number of tokens actually written (≤ max_tokens)
     """
-    tokens = []
-    n_docs = 0
+    chunk   = []          # tiny staging buffer — flushed every CHUNK_TOKENS
+    written = 0           # tokens committed to disk so far
+    n_docs  = 0
     t_start = time.time()
     last_report = 0
 
+    def _flush():
+        nonlocal chunk, written
+        if not chunk:
+            return
+        np.array(chunk, dtype=np.uint32).tofile(bin_f)
+        written += len(chunk)
+        chunk = []
+
     for item in ds:
+        # ── Extract text field ────────────────────────────────────────────────
         text = ""
         for field in text_fields:
             if field in item and item[field]:
@@ -355,7 +375,7 @@ def stream_tokens(ds, max_tokens, source_name, max_doc_length=8192,
         if not text or len(text) < 10:
             continue
 
-        # Tokenize with LeoTokenizer (NOT GPT-2!)
+        # ── Tokenize with LeoTokenizer (NOT GPT-2!) ───────────────────────────
         ids = tok.encode(
             text,
             truncation=True,
@@ -365,32 +385,47 @@ def stream_tokens(ds, max_tokens, source_name, max_doc_length=8192,
         if not ids:
             continue
 
-        # Wrap with BOS/EOS
+        # ── Wrap with BOS/EOS and stage in chunk ─────────────────────────────
         full = [BOS_ID] + ids + [EOS_ID]
-        tokens.extend(full)
+
+        # If adding this doc would exceed budget, trim and flush then stop
+        remaining = max_tokens - (written + len(chunk))
+        if len(full) >= remaining:
+            chunk.extend(full[:remaining])
+            _flush()
+            elapsed = time.time() - t_start
+            print(f"   ✅ {source_name}: {written:>14,} tokens "
+                  f"| {n_docs:>7,} docs | {elapsed:.0f}s")
+            return written
+
+        chunk.extend(full)
         n_docs += 1
 
-        if len(tokens) >= max_tokens:
-            elapsed = time.time() - t_start
-            print(f"   ✅ {source_name}: {len(tokens):>14,} tokens "
-                  f"| {n_docs:>7,} docs | {elapsed:.0f}s")
-            return tokens[:max_tokens]
+        # ── Flush to disk every CHUNK_TOKENS ──────────────────────────────────
+        if len(chunk) >= CHUNK_TOKENS:
+            _flush()
 
-        if len(tokens) - last_report >= 50_000:
-            pct = len(tokens) / max_tokens * 100
+        # ── Progress report every 50k tokens ──────────────────────────────────
+        total_so_far = written + len(chunk)
+        if total_so_far - last_report >= 50_000:
+            pct     = total_so_far / max_tokens * 100
             elapsed = time.time() - t_start
-            tps = max(len(tokens) / elapsed, 1)
-            eta = (max_tokens - len(tokens)) / tps
-            print(f"   {source_name}: {len(tokens):>14,} / {max_tokens:,} "
+            tps     = max(total_so_far / elapsed, 1)
+            eta     = (max_tokens - total_so_far) / tps
+            print(f"   {source_name}: {total_so_far:>14,} / {max_tokens:,} "
                   f"({pct:5.1f}%) | {n_docs:>7,} docs "
                   f"| {tps/1000:.0f}k t/s | ETA {eta/60:.0f}m")
-            last_report = len(tokens)
+            last_report = total_so_far
 
-    print(f"   ⚠️  {source_name}: only {len(tokens):,} / {max_tokens:,} available")
-    return tokens
+    # ── Dataset exhausted before budget reached ───────────────────────────────
+    _flush()
+    print(f"   ⚠️  {source_name}: only {written:,} / {max_tokens:,} available")
+    return written
 
 
-all_tokens = []
+# ── Open binary sink once — all 6 sources write into this file ────────────────
+total_written = 0
+_bin_f = open(TMP_BIN, "wb")
 
 # ─── SOURCE 1: FineWeb-Edu ────────────────────────────────────────────────────
 print("=" * 65)
@@ -399,14 +434,13 @@ print("=" * 65)
 try:
     ds = load_dataset("HuggingFaceFW/fineweb-edu", name="sample-10BT",
                       split="train", streaming=True)
-    toks = stream_tokens(ds, sources["fineweb_edu"], "fineweb-edu", 8192)
+    total_written += stream_tokens_to_bin(ds, sources["fineweb_edu"], "fineweb-edu", _bin_f, 8192)
 except Exception as e:
     print(f"   ⚠️  {e} — trying CC-MAIN fallback...")
     ds = load_dataset("HuggingFaceFW/fineweb", name="CC-MAIN-2024-10",
                       split="train", streaming=True)
-    toks = stream_tokens(ds, sources["fineweb_edu"], "fineweb-fallback", 8192)
-all_tokens.extend(toks)
-print(f"   Running total: {len(all_tokens):,}\n")
+    total_written += stream_tokens_to_bin(ds, sources["fineweb_edu"], "fineweb-fallback", _bin_f, 8192)
+print(f"   Running total: {total_written:,}\n")
 
 # ─── SOURCE 2: FineMath ───────────────────────────────────────────────────────
 print("=" * 65)
@@ -415,67 +449,63 @@ print("=" * 65)
 try:
     ds = load_dataset("HuggingFaceTB/finemath", name="finemath-3plus",
                       split="train", streaming=True)
-    toks = stream_tokens(ds, sources["finemath"], "finemath", 4096)
+    total_written += stream_tokens_to_bin(ds, sources["finemath"], "finemath", _bin_f, 4096)
 except Exception as e:
     print(f"   ⚠️  {e} — OpenWebMath backup...")
     try:
         ds = load_dataset("open-web-math/open-web-math", split="train", streaming=True)
-        toks = stream_tokens(ds, sources["finemath"], "owm-backup", 4096)
+        total_written += stream_tokens_to_bin(ds, sources["finemath"], "owm-backup", _bin_f, 4096)
     except Exception as e2:
         print(f"   ⚠️  {e2} — proof-pile backup...")
         ds = load_dataset("EleutherAI/proof-pile", split="train", streaming=True)
-        toks = stream_tokens(ds, sources["finemath"], "proof-pile", 4096)
-all_tokens.extend(toks)
-print(f"   Running total: {len(all_tokens):,}\n")
+        total_written += stream_tokens_to_bin(ds, sources["finemath"], "proof-pile", _bin_f, 4096)
+print(f"   Running total: {total_written:,}\n")
 
 # ─── SOURCE 3: The Stack ─────────────────────────────────────────────────────
 print("=" * 65)
 print("SOURCE 3/6 — The Stack (400M code tokens)")
 print(f"   Auth: {'✅ HF_TOKEN set' if _HF_TOKEN else '⚠️  No HF_TOKEN — will use fallback'}")
 print("=" * 65)
-stack_loaded = False
+stack_written = 0
 # Primary: the-stack-smol (gated — needs HF_TOKEN + licence accepted on HF website)
 if _HF_TOKEN:
     try:
         ds = load_dataset("bigcode/the-stack-smol", split="train",
                           streaming=True, token=_HF_TOKEN)
-        toks = stream_tokens(ds, sources["the_stack"], "the-stack", 4096,
-                             text_fields=("content", "text"))
-        stack_loaded = True
+        stack_written = stream_tokens_to_bin(ds, sources["the_stack"], "the-stack", _bin_f, 4096,
+                                             text_fields=("content", "text"))
     except Exception as e:
         print(f"   ⚠️  the-stack-smol failed even with token: {e}")
         print("   → Did you accept the licence at huggingface.co/datasets/bigcode/the-stack-smol ?")
 
-if not stack_loaded:
+if not stack_written:
     # Fallback 1: smollm python-edu (no auth needed)
     try:
         print("   Trying python-edu fallback (no auth needed)...")
         ds = load_dataset("HuggingFaceTB/smollm-corpus", name="python-edu",
                           split="train", streaming=True)
-        toks = stream_tokens(ds, sources["the_stack"], "python-edu", 4096)
-        stack_loaded = True
+        stack_written = stream_tokens_to_bin(ds, sources["the_stack"], "python-edu", _bin_f, 4096)
     except Exception as e:
         print(f"   ⚠️  python-edu failed: {e}")
 
-if not stack_loaded:
+if not stack_written:
     # Fallback 2: codeparrot (fully public)
     try:
         print("   Trying codeparrot fallback...")
         ds = load_dataset("codeparrot/github-code", streaming=True,
                           split="train")
-        toks = stream_tokens(ds, sources["the_stack"], "codeparrot", 4096,
-                             text_fields=("code", "content", "text"))
-        stack_loaded = True
+        stack_written = stream_tokens_to_bin(ds, sources["the_stack"], "codeparrot", _bin_f, 4096,
+                                             text_fields=("code", "content", "text"))
     except Exception as e:
         print(f"   ⚠️  codeparrot failed: {e}")
 
-if not stack_loaded:
+if not stack_written:
     print("   ⚠️  All code sources failed — padding with FineWeb-Edu...")
     ds = load_dataset("HuggingFaceFW/fineweb-edu", name="sample-10BT",
                       split="train", streaming=True)
-    toks = stream_tokens(ds, sources["the_stack"], "code-fallback", 8192)
-all_tokens.extend(toks)
-print(f"   Running total: {len(all_tokens):,}\n")
+    stack_written = stream_tokens_to_bin(ds, sources["the_stack"], "code-fallback", _bin_f, 8192)
+total_written += stack_written
+print(f"   Running total: {total_written:,}\n")
 
 # ─── SOURCE 4: OpenWebMath ────────────────────────────────────────────────────
 print("=" * 65)
@@ -483,21 +513,20 @@ print("SOURCE 4/6 — OpenWebMath (200M web math tokens)")
 print("=" * 65)
 try:
     ds = load_dataset("open-web-math/open-web-math", split="train", streaming=True)
-    toks = stream_tokens(ds, sources["open_web_math"], "open-web-math", 4096)
+    total_written += stream_tokens_to_bin(ds, sources["open_web_math"], "open-web-math", _bin_f, 4096)
 except Exception as e:
     print(f"   ⚠️  {e} — extra FineWeb-Edu...")
     ds = load_dataset("HuggingFaceFW/fineweb-edu", name="sample-10BT",
                       split="train", streaming=True)
-    toks = stream_tokens(ds, sources["open_web_math"], "fineweb-extra", 8192)
-all_tokens.extend(toks)
-print(f"   Running total: {len(all_tokens):,}\n")
+    total_written += stream_tokens_to_bin(ds, sources["open_web_math"], "fineweb-extra", _bin_f, 8192)
+print(f"   Running total: {total_written:,}\n")
 
 # ─── SOURCE 5: Books (32k context anchor) ────────────────────────────────────
 print("=" * 65)
 print("SOURCE 5/6 — Books (300M tokens — anchors 32k context training)")
 print("   Key: books naturally produce full 32k windows of coherent text")
 print("=" * 65)
-books_loaded = False
+books_written = 0
 for name, kwargs in [
     ("dolma-books",   dict(path="allenai/dolma", name="books",
                            split="train", streaming=True)),
@@ -511,24 +540,23 @@ for name, kwargs in [
                              if k not in ("path",)},
                           path=kwargs["path"])
         # Use max_doc_length=32768 for books — let them fill entire windows
-        toks = stream_tokens(ds, sources["dolma_books"], name, 32768)
-        books_loaded = True
+        books_written = stream_tokens_to_bin(ds, sources["dolma_books"], name, _bin_f, 32768)
         break
     except Exception as e:
         print(f"   ⚠️  {name} failed: {e}")
-if not books_loaded:
+if not books_written:
     print("   ⚠️  All book sources failed — padding with FineWeb-Edu...")
     ds = load_dataset("HuggingFaceFW/fineweb-edu", name="sample-10BT",
                       split="train", streaming=True)
-    toks = stream_tokens(ds, sources["dolma_books"], "books-fallback", 8192)
-all_tokens.extend(toks)
-print(f"   Running total: {len(all_tokens):,}\n")
+    books_written = stream_tokens_to_bin(ds, sources["dolma_books"], "books-fallback", _bin_f, 8192)
+total_written += books_written
+print(f"   Running total: {total_written:,}\n")
 
 # ─── SOURCE 6: Wikipedia (factual grounding) ─────────────────────────────────
 print("=" * 65)
 print("SOURCE 6/6 — Wikipedia (200M tokens — factual ECT grounding)")
 print("=" * 65)
-wiki_loaded = False
+wiki_written = 0
 for name, kwargs in [
     ("dolma-wiki",   dict(path="allenai/dolma", name="wiki",
                           split="train", streaming=True)),
@@ -540,40 +568,78 @@ for name, kwargs in [
     try:
         ds = load_dataset(**{k: v for k, v in kwargs.items()
                              if k not in ("path",)}, path=kwargs["path"])
-        toks = stream_tokens(ds, sources["dolma_wiki"], name, 4096,
-                             text_fields=("text", "passage", "content"))
-        wiki_loaded = True
+        wiki_written = stream_tokens_to_bin(ds, sources["dolma_wiki"], name, _bin_f, 4096,
+                                            text_fields=("text", "passage", "content"))
         break
     except Exception as e:
         print(f"   ⚠️  {name} failed: {e}")
-all_tokens.extend(toks)
-print(f"   Running total: {len(all_tokens):,}\n")
+total_written += wiki_written
+print(f"   Running total: {total_written:,}\n")
+
+# ── Close the binary sink — all tokens now on disk ────────────────────────────
+_bin_f.close()
 
 # ══════════════════════════════════════════════════════════════════════════════
-# SAVE AS uint32
+# SAVE AS uint32 — via memmap (zero extra RAM)
+# ══════════════════════════════════════════════════════════════════════════════
+# Strategy:
+#   1. tokens_tmp.bin is a flat uint32 file already on disk
+#   2. Open it as np.memmap — no data is loaded into RAM
+#   3. Compute split index, then copy slices into proper .npy files
+#      using np.lib.format.open_memmap (also disk-based — still no RAM spike)
+#   4. Delete the temp file
 # ══════════════════════════════════════════════════════════════════════════════
 print("=" * 65)
-print(f"💾 SAVING {len(all_tokens):,} tokens as uint32...")
+print(f"💾 SAVING {total_written:,} tokens as uint32 (memmap — no RAM spike)...")
 print(f"   (uint32 required: vocab {tok.vocab_size:,} > uint16 max 65535)")
 print("=" * 65)
 
-arr = np.array(all_tokens, dtype=np.uint32)
-split_idx    = int(len(arr) * 0.97)
-train_arr    = arr[:split_idx]
-val_arr      = arr[split_idx:]
+# Memory-map the raw binary we just wrote — reads nothing into RAM
+mm = np.memmap(TMP_BIN, dtype=np.uint32, mode="r", shape=(total_written,))
 
-np.save("data/train.npy", train_arr)
-np.save("data/val.npy",   val_arr)
+split_idx  = int(total_written * 0.97)
+n_train    = split_idx
+n_val      = total_written - split_idx
+
+SLICE_SIZE = 10_000_000   # write 10M tokens (~40MB) at a time
+
+# ── Write train.npy ───────────────────────────────────────────────────────────
+print(f"   Writing train.npy  ({n_train:,} tokens)...")
+train_mm = np.lib.format.open_memmap(
+    "data/train.npy", mode="w+", dtype=np.uint32, shape=(n_train,)
+)
+for start in range(0, n_train, SLICE_SIZE):
+    end = min(start + SLICE_SIZE, n_train)
+    train_mm[start:end] = mm[start:end]
+    if (start // SLICE_SIZE) % 5 == 0:
+        pct = end / n_train * 100
+        print(f"     train: {end:>12,} / {n_train:,}  ({pct:.1f}%)")
+del train_mm   # flush + close
+
+# ── Write val.npy ─────────────────────────────────────────────────────────────
+print(f"   Writing val.npy    ({n_val:,} tokens)...")
+val_mm = np.lib.format.open_memmap(
+    "data/val.npy", mode="w+", dtype=np.uint32, shape=(n_val,)
+)
+for start in range(0, n_val, SLICE_SIZE):
+    end = min(start + SLICE_SIZE, n_val)
+    val_mm[start:end] = mm[split_idx + start : split_idx + end]
+del val_mm     # flush + close
+
+# ── Clean up temp file ────────────────────────────────────────────────────────
+del mm
+os.remove(TMP_BIN)
+print(f"   Temp file removed: {TMP_BIN}")
 
 train_gb = os.path.getsize("data/train.npy") / 1e9
 val_mb   = os.path.getsize("data/val.npy")   / 1e6
 
 print(f"\n✅ DONE!")
-print(f"   Train:    {len(train_arr):>16,} tokens | {train_gb:.2f} GB")
-print(f"   Val:      {len(val_arr):>16,} tokens | {val_mb:.0f} MB")
+print(f"   Train:    {n_train:>16,} tokens | {train_gb:.2f} GB")
+print(f"   Val:      {n_val:>16,} tokens | {val_mb:.0f} MB")
 print(f"   Tokenizer: LeoTokenizer (65,536 vocab) → ./leo_tokenizer/")
 print(f"\n   Source breakdown:")
 for name, budget in sources.items():
     print(f"     {name:<20}: {budget:>12,} tokens target")
-print(f"\n   At 32k context: {len(train_arr)//32768:,} full-length windows")
-print(f"\n Leo Aether data ready! Run: python3 train.py")
+print(f"\n   At 32k context: {n_train//32768:,} full-length windows")
+print(f"\n🦁 Leo Aether data ready! Run: python3 train.py")
