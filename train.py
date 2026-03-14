@@ -1,46 +1,14 @@
-"""
-LeoSLM "Aether" — train.py
-============================
-Training orchestration ONLY.  No model classes live here.
-
-All architecture is in model/   — import from there.
-All loss / RL code is in training/ — import from there.
-Dataset is in data/ — import from there.
-
-This file contains only:
-    load_leotokenizer()   — tokenizer bootstrap
-    cosine_lr()           — learning-rate schedule
-    set_lr()              — apply lr to optimizer
-    save_ckpt()           — atomic checkpoint save
-    load_ckpt()           — checkpoint restore
-    PHASE_CFG             — 8-phase training schedule
-    run_phase()           — single-phase training loop
-    main()                — CLI entry point
-
-Usage:
-    python3 train.py                   # all 8 phases
-    python3 train.py --phase 1         # AR warmup only
-    python3 train.py --resume          # resume from checkpoints/latest.pt
-    python3 train.py --smoke           # 50-step smoke test
-    python3 train.py --phase 6         # GRPO think RL only
-    python3 train.py --phase 8         # Agentic RL only
-
-Training Phases (Progressive Confidence Curriculum — PCC):
-    1  AR warmup         4k  ctx  — basic language
-    2  Diffusion warmup  8k  ctx  — learn uncertainty
-    3  Full MoE + ECT   16k  ctx  — specialization + MTP
-    4  SFT alignment    32k  ctx  — instructions + IDK + identity
-    5  Factuality DPO   32k  ctx  — FActScore preference training
-    6  GRPO Think RL    32k  ctx  — DeepSeek-R1 CoT reinforcement
-    7  Agentic SFT      32k  ctx  — tool-use format + MCP + web search
-    8  Agentic RL       32k  ctx  — GRPO on full tool-call trajectories
-"""
-
-# ── XLA environment — MUST precede all imports ────────────────────────────────
 import os
 os.environ["XLA_USE_BF16"]                  = "1"
 os.environ["XLA_TENSOR_ALLOCATOR_MAXSIZE"]  = "1000000000"
 os.environ["PJRT_DEVICE"]                   = "TPU"
+os.environ["XLA_FLAGS"]                     = (
+    "--xla_tpu_enable_async_collective_fusion=true "
+    "--xla_tpu_enable_async_collective_fusion_fuse_all_gather=true "
+    "--xla_tpu_enable_async_collective_fusion_multiple_steps=true "
+    "--xla_tpu_overlap_compute_collective_tc=true "
+    "--xla_enable_async_all_gather=true"
+)
 
 import sys
 import math
@@ -53,57 +21,50 @@ import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
 
-# ── TPU backend ───────────────────────────────────────────────────────────────
 try:
     import torch_xla
-    import torch_xla.core.xla_model           as xm
+    import torch_xla.core.xla_model                  as xm
     import torch_xla.distributed.xla_multiprocessing as xmp
-    import torch_xla.distributed.parallel_loader    as pl
+    import torch_xla.distributed.parallel_loader     as pl
     from torch_xla.distributed.fsdp import XlaFullyShardedDataParallel as FSDP
     XLA_AVAILABLE = True
-    xm.master_print("✅ torch_xla: TPU mode")
+    xm.master_print("torch_xla: TPU mode")
 except ImportError:
     XLA_AVAILABLE = False
     FSDP = None
 
     class _XMFallback:
-        def xla_device(self):          return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        def xla_device(self):             return torch.device("cuda" if torch.cuda.is_available() else "cpu")
         def optimizer_step(self, o, **k): o.step()
-        def mark_step(self):           pass
-        def get_ordinal(self):         return 0
-        def xrt_world_size(self):      return 1
-        def master_print(self, *a, **k): print(*a, **k)
+        def mark_step(self):              pass
+        def get_ordinal(self):            return 0
+        def xrt_world_size(self):         return 1
+        def master_print(self, *a, **k):  print(*a, **k)
 
     xm = _XMFallback()
-    print("⚠️  torch_xla not found — CPU/GPU fallback")
+    print("torch_xla not found — CPU/GPU fallback")
 
-# ── Adafactor ─────────────────────────────────────────────────────────────────
 try:
     from transformers.optimization import Adafactor
 except ImportError:
-    os.system("pip install transformers -q")
+    import subprocess
+    subprocess.run([sys.executable, "-m", "pip", "install", "--user", "transformers", "-q"], check=True)
     from transformers.optimization import Adafactor
 
-# ── Project imports (all model/training/data logic lives in modules) ──────────
 from model    import LeoSLM, LeoConfig, CFG, LEO_IDENTITY
 from training import LeoLoss, GRPOTrainer, AgenticGRPO
 from data     import LeoDataset
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# TOKENIZER BOOTSTRAP
-# ══════════════════════════════════════════════════════════════════════════════
-
 def load_leotokenizer(path: str = "./leo_tokenizer"):
-    """Load the custom LeoTokenizer. Falls back to GPT-2 if not yet built."""
     if Path(f"{path}/tokenizer.json").exists():
         from transformers import PreTrainedTokenizerFast
         tok = PreTrainedTokenizerFast.from_pretrained(path)
-        xm.master_print(f"✅ LeoTokenizer loaded (vocab={tok.vocab_size:,})")
+        xm.master_print(f"LeoTokenizer loaded (vocab={tok.vocab_size:,})")
         return tok
 
-    xm.master_print("⚠️  LeoTokenizer not found — run prep_data.py --tok-only first")
-    xm.master_print("    Falling back to GPT-2 tokenizer as placeholder...")
+    xm.master_print("LeoTokenizer not found — run prep_data.py --tok-only first")
+    xm.master_print("Falling back to GPT-2 tokenizer as placeholder...")
     from transformers import AutoTokenizer
     tok = AutoTokenizer.from_pretrained("gpt2")
     tok.add_special_tokens({
@@ -119,10 +80,6 @@ def load_leotokenizer(path: str = "./leo_tokenizer"):
     return tok
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# LEARNING-RATE SCHEDULE + OPTIMIZER UTILS
-# ══════════════════════════════════════════════════════════════════════════════
-
 def cosine_lr(
     step:    int,
     warmup:  int,
@@ -130,7 +87,6 @@ def cosine_lr(
     lr_max:  float,
     lr_min:  float,
 ) -> float:
-    """Linear warmup → cosine decay schedule."""
     if total <= 0:
         return lr_max
     if step < warmup:
@@ -140,24 +96,11 @@ def cosine_lr(
 
 
 def set_lr(optimizer, lr: float):
-    """Apply a new learning rate to all optimizer param groups."""
     for pg in optimizer.param_groups:
         pg["lr"] = lr
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# CHECKPOINT UTILS
-# ══════════════════════════════════════════════════════════════════════════════
-
-def save_ckpt(
-    model,
-    optimizer,
-    step:  int,
-    phase: int,
-    loss:  float,
-    path:  str,
-):
-    """Atomic checkpoint save (write to .tmp then rename)."""
+def save_ckpt(model, optimizer, step: int, phase: int, loss: float, path: str):
     os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
     tmp = path + ".tmp"
     torch.save({
@@ -168,79 +111,39 @@ def save_ckpt(
         "loss":      loss,
     }, tmp)
     os.replace(tmp, path)
-    xm.master_print(f"   💾 {path} (step={step}, phase={phase}, loss={loss:.3f})")
+    xm.master_print(f"   saved {path} (step={step}, phase={phase}, loss={loss:.3f})")
 
 
 def load_ckpt(model, optimizer, path: str, device) -> tuple:
-    """
-    Restore model + optimizer state from a checkpoint.
-
-    Returns:
-        (step, phase) to resume from
-    """
     if not os.path.exists(path):
         return 0, 1
     c = torch.load(path, map_location=device)
     model.load_state_dict(c["model"])
     if optimizer and "optimizer" in c:
         optimizer.load_state_dict(c["optimizer"])
-    xm.master_print(
-        f"   ✅ Resumed {path} (step={c.get('step', 0)}, phase={c.get('phase', 1)})"
-    )
+    xm.master_print(f"   Resumed {path} (step={c.get('step', 0)}, phase={c.get('phase', 1)})")
     return c.get("step", 0), c.get("phase", 1)
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# PHASE CONFIGURATION — Progressive Confidence Curriculum
-# ══════════════════════════════════════════════════════════════════════════════
-
 PHASE_CFG: Dict[int, Dict] = {
-    1: {
-        "epochs": 2, "ctx":  4096, "tau": 0.50,
-        "lr": 1e-3, "warmup": 500, "mdm": 0.0,
-        "desc": "AR warmup (4k ctx) — basic language modelling",
-    },
-    2: {
-        "epochs": 2, "ctx":  8192, "tau": 0.45,
-        "lr": 8e-4, "warmup": 300, "mdm": 0.5,
-        "desc": "Diffusion warmup (8k ctx) — learn uncertainty",
-    },
-    3: {
-        "epochs": 2, "ctx": 16384, "tau": 0.40,
-        "lr": 5e-4, "warmup": 200, "mdm": 0.5,
-        "desc": "Full MoE + ECT (16k ctx) — specialization + MTP",
-    },
-    4: {
-        "epochs": 2, "ctx": 32768, "tau": 0.35,
-        "lr": 3e-4, "warmup": 200, "mdm": 0.5,
-        "desc": "SFT alignment (32k ctx) — instructions + IDK + identity",
-    },
-    5: {
-        "epochs": 1, "ctx": 32768, "tau": 0.35,
-        "lr": 1e-4, "warmup": 100, "mdm": 0.3,
-        "desc": "Factuality DPO (32k ctx) — FActScore preference",
-    },
-    6: {
-        "epochs": 2, "ctx": 32768, "tau": 0.30,
-        "lr": 5e-5, "warmup": 100, "mdm": 0.0,
-        "desc": "GRPO Think RL (32k ctx) — DeepSeek-R1 CoT",
-    },
-    7: {
-        "epochs": 2, "ctx": 32768, "tau": 0.30,
-        "lr": 3e-5, "warmup": 100, "mdm": 0.0,
-        "desc": "Agentic SFT (32k ctx) — tool format + MCP + web search + TTIP",
-    },
-    8: {
-        "epochs": 2, "ctx": 32768, "tau": 0.28,
-        "lr": 1e-5, "warmup":  50, "mdm": 0.0,
-        "desc": "Agentic RL (32k ctx) — GRPO + MSRA trajectory credit",
-    },
+    1: {"epochs": 2, "ctx":  4096, "tau": 0.50, "lr": 1e-3, "warmup": 500, "mdm": 0.0,
+        "desc": "AR warmup (4k ctx)"},
+    2: {"epochs": 2, "ctx":  8192, "tau": 0.45, "lr": 8e-4, "warmup": 300, "mdm": 0.5,
+        "desc": "Diffusion warmup (8k ctx)"},
+    3: {"epochs": 2, "ctx": 16384, "tau": 0.40, "lr": 5e-4, "warmup": 200, "mdm": 0.5,
+        "desc": "Full MoE + ECT (16k ctx)"},
+    4: {"epochs": 2, "ctx": 32768, "tau": 0.35, "lr": 3e-4, "warmup": 200, "mdm": 0.5,
+        "desc": "SFT alignment (32k ctx)"},
+    5: {"epochs": 1, "ctx": 32768, "tau": 0.35, "lr": 1e-4, "warmup": 100, "mdm": 0.3,
+        "desc": "Factuality DPO (32k ctx)"},
+    6: {"epochs": 2, "ctx": 32768, "tau": 0.30, "lr": 5e-5, "warmup": 100, "mdm": 0.0,
+        "desc": "GRPO Think RL (32k ctx)"},
+    7: {"epochs": 2, "ctx": 32768, "tau": 0.30, "lr": 3e-5, "warmup": 100, "mdm": 0.0,
+        "desc": "Agentic SFT (32k ctx)"},
+    8: {"epochs": 2, "ctx": 32768, "tau": 0.28, "lr": 1e-5, "warmup":  50, "mdm": 0.0,
+        "desc": "Agentic RL (32k ctx)"},
 }
 
-
-# ══════════════════════════════════════════════════════════════════════════════
-# PHASE TRAINING LOOP
-# ══════════════════════════════════════════════════════════════════════════════
 
 def run_phase(
     phase:      int,
@@ -255,22 +158,6 @@ def run_phase(
     start_step: int  = 0,
     smoke:      bool = False,
 ) -> int:
-    """
-    Train for one phase. Returns the final global step count.
-
-    Args:
-        phase      : phase number 1-8
-        model      : LeoSLM instance
-        optimizer  : Adafactor optimizer
-        dataset    : LeoDataset (seq_len updated inside this function)
-        loss_fn    : LeoLoss instance
-        device     : xla / cuda / cpu device
-        grad_accum : gradient accumulation steps
-        save_every : checkpoint every N steps
-        ckpt_dir   : checkpoint directory
-        start_step : global step to resume from
-        smoke      : if True, stop after 50 steps (smoke test)
-    """
     pc      = PHASE_CFG[phase]
     epochs  = 1 if smoke else pc["epochs"]
     ctx     = pc["ctx"]
@@ -280,30 +167,25 @@ def run_phase(
 
     xm.master_print(f"\n{'='*65}")
     xm.master_print(f"  PHASE {phase} — {pc['desc']}")
-    xm.master_print(f"  ctx={ctx:,} | τ={tau} | lr={lr_max} | epochs={epochs}")
+    xm.master_print(f"  ctx={ctx:,} | tau={tau} | lr={lr_max} | epochs={epochs}")
     xm.master_print(f"{'='*65}")
 
-    # Unwrap FSDP so we can safely access .cfg and call .freeze_phase().
-    # FSDP forwards most attrs but cfg mutation and freeze logic are fragile on the wrapper.
     raw_model = model.module if hasattr(model, "module") else model
 
-    # Update dataset context length and model uncertainty threshold for this phase
     dataset.set_seq_len(ctx)
     raw_model.cfg.uncertainty_thresh = tau
     raw_model.freeze_phase(phase)
     loss_fn.set_lambda_mdm(pc["mdm"])
 
-    # Phase 5 needs batch_size=2 so we can split chosen/rejected pairs by uncertainty.
-    # All other phases use batch_size=1 (memory budget from config).
     batch_size = 2 if phase == 5 else 1
     loader = DataLoader(dataset, batch_size=batch_size, shuffle=True, num_workers=0, drop_last=True)
     if XLA_AVAILABLE:
         loader = pl.MpDeviceLoader(loader, device)
 
-    # Instantiate phase-specific trainers (only created when needed)
     dpo          = None
     grpo         = None
     agentic_grpo = None
+
     if phase == 5:
         from training import FactualityDPO
         dpo = FactualityDPO(raw_model.cfg, beta=0.1)
@@ -332,25 +214,19 @@ def run_phase(
     optimizer.zero_grad()
 
     for epoch in range(epochs):
-        # ep_loss_sum stays on XLA — we only call .item() once per epoch at the end.
-        # This avoids per-step host syncs while keeping the epoch avg correct.
         ep_loss_sum = torch.zeros(1, device=device)
         nb          = 0
 
         for batch in loader:
             input_ids = batch["input_ids"].to(device)
 
-            # LR schedule
             lr = cosine_lr(step, pc["warmup"], total_steps, lr_max, lr_min)
             set_lr(optimizer, lr)
 
-            # ── Forward + loss ─────────────────────────────────────────────────
             if phase == 5 and dpo is not None:
-                # DPO Phase: batch_size=2 — sort by uncertainty → chosen / rejected
                 out    = model(input_ids)
-                U_mean = out["uncertainty"].mean(dim=1)      # (2,)
+                U_mean = out["uncertainty"].mean(dim=1)
                 lo, hi = (0, 1) if U_mean[0] <= U_mean[1] else (1, 0)
-                # Slice all (2, ...) tensors into chosen / rejected dicts
                 chosen_out   = {k: v[lo:lo+1] for k, v in out.items()
                                 if isinstance(v, torch.Tensor) and v.shape[0] == 2}
                 rejected_out = {k: v[hi:hi+1] for k, v in out.items()
@@ -370,12 +246,10 @@ def run_phase(
                 (loss / grad_accum).backward()
 
             else:
-                # Phases 1-4, 7: standard supervised training
                 out           = model(input_ids)
                 loss, metrics = loss_fn(out, input_ids, model=raw_model, phase=phase)
                 (loss / grad_accum).backward()
 
-            # ── Gradient step ──────────────────────────────────────────────────
             if (step + 1) % grad_accum == 0:
                 torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
                 if XLA_AVAILABLE:
@@ -385,11 +259,9 @@ def run_phase(
                     optimizer.step()
                 optimizer.zero_grad()
 
-            # ── Logging + Checkpoint (deferred .item() — XLA sync only here) ──
             nb   += 1
             step += 1
 
-            # Accumulate epoch loss as a tensor every step — no .item(), no XLA sync.
             _loss_t = metrics.get("total", loss)
             if isinstance(_loss_t, torch.Tensor):
                 ep_loss_sum = ep_loss_sum + _loss_t.detach()
@@ -400,8 +272,6 @@ def run_phase(
             _do_ckpt = (step % save_every == 0)
 
             if _do_log or _do_ckpt:
-                # Materialise scalars once per interval, not every step.
-                # This is the ONLY place we sync XLA device→host for metrics.
                 loss_val = loss.item() if isinstance(loss, torch.Tensor) else loss
                 m_cpu    = {k: (v.item() if isinstance(v, torch.Tensor) else v)
                             for k, v in metrics.items()}
@@ -418,7 +288,6 @@ def run_phase(
                     f"{extra} lr={lr:.2e} | {time.time()-t0:.0f}s"
                 )
 
-            # ── Checkpoint ────────────────────────────────────────────────────
             if _do_ckpt:
                 save_ckpt(model, optimizer, step, phase,
                           m_cpu.get("total", loss_val),
@@ -428,12 +297,11 @@ def run_phase(
                           f"{ckpt_dir}/latest.pt")
 
             if smoke and step >= start_step + 50:
-                xm.master_print("  🔥 Smoke test complete (50 steps)")
+                xm.master_print("  Smoke test complete (50 steps)")
                 return step
 
-        # Single XLA sync per epoch — correct average over all steps
         avg = ep_loss_sum.cpu().item() / max(nb, 1)
-        xm.master_print(f"  ✅ Epoch {epoch+1}/{epochs} | avg_loss={avg:.3f}")
+        xm.master_print(f"  Epoch {epoch+1}/{epochs} | avg_loss={avg:.3f}")
         if avg < best:
             best = avg
             save_ckpt(model, optimizer, step, phase, avg,
@@ -442,86 +310,71 @@ def run_phase(
     return step
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# MAIN
-# ══════════════════════════════════════════════════════════════════════════════
-
 def main(rank=None):
-    parser = argparse.ArgumentParser(description="Leo Aether — LeoSLM training")
-    parser.add_argument("--phase",      type=int,   default=0,
-                        help="Run single phase (1-8); 0 = all phases")
-    parser.add_argument("--resume",     action="store_true",
-                        help="Resume from ./checkpoints/latest.pt")
-    parser.add_argument("--smoke",      action="store_true",
-                        help="50-step smoke test")
+    parser = argparse.ArgumentParser(description="Leo Aether training")
+    parser.add_argument("--phase",      type=int,   default=0)
+    parser.add_argument("--resume",     action="store_true")
+    parser.add_argument("--smoke",      action="store_true")
     parser.add_argument("--train_data", type=str,   default="./data/train.npy")
     parser.add_argument("--ckpt_dir",   type=str,   default="./checkpoints")
-    parser.add_argument("--grad_accum", type=int,   default=16,
-                        help="Gradient accumulation steps (eff. batch = 1 × accum × 8 chips)")
-    parser.add_argument("--save_every", type=int,   default=100,
-                        help="Save checkpoint every N steps")
+    parser.add_argument("--grad_accum", type=int,   default=16)
+    parser.add_argument("--save_every", type=int,   default=100)
     args = parser.parse_args()
 
     device = xm.xla_device() if XLA_AVAILABLE else (
         torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
     )
 
-    # ── Banner ────────────────────────────────────────────────────────────────
     xm.master_print(f"\n{'='*65}")
-    xm.master_print(f"  🦁  {LEO_IDENTITY['full_name']}")
+    xm.master_print(f"  {LEO_IDENTITY['full_name']}")
     xm.master_print(f"  Built by  : {LEO_IDENTITY['creator']}")
     xm.master_print(f"  Arch      : {LEO_IDENTITY['architecture']}")
     xm.master_print(f"  Params    : {LEO_IDENTITY['parameters']}")
     xm.master_print(f"  Context   : {LEO_IDENTITY['context']}")
     xm.master_print(f"  Hardware  : {LEO_IDENTITY['hardware']}")
     xm.master_print(f"  Device    : {device}")
-    xm.master_print(f"  Phases    : 8 (AR → Diff → MoE → SFT → DPO → GRPO → AgSFT → AgRL)")
-    xm.master_print(f"  Novel     : ACGI | SAM | ESTR | TTIP | MSRA | MTP | DSA-lite | EPE")
     xm.master_print(f"{'='*65}\n")
 
-    # ── Model ─────────────────────────────────────────────────────────────────
     cfg   = LeoConfig()
     model = LeoSLM(cfg).to(device)
 
-    # count_params() BEFORE FSDP — after sharding each chip only holds 1/8th
-    # of the params so numel() returns near-zero on each rank.
-    pc = model.count_params()
-    xm.master_print(f"   Params   : {pc['total']/1e9:.2f}B total "
-                    f"| ~{pc['approx_active']/1e9:.2f}B active (MoE)")
-    xm.master_print(f"   MTP(N={cfg.mtp_n}) | DSA(>{cfg.dsa_threshold//1024}k) "
-                    f"| ACGI(τ={cfg.acgi_threshold}) | SAM(M={cfg.sam_memory_size})")
+    pc = model.count_params_detailed()
+    xm.master_print(
+        f"   Params   : {pc['total']/1e9:.2f}B total "
+        f"| ~{pc.get('active_approx', pc['total'])/1e9:.2f}B active (MoE)"
+    )
+    xm.master_print(
+        f"   MTP(N={cfg.mtp_n}) | DSA(>{cfg.dsa_threshold//1024}k) "
+        f"| ACGI(tau={cfg.acgi_threshold}) | SAM(M={cfg.sam_memory_size})"
+    )
 
     if XLA_AVAILABLE and FSDP is not None:
-        # XlaFSDP only supports fp32 parameters — wrap first, then cast to bf16
         model = FSDP(model, reshard_after_forward=True)
         model = model.to(torch.bfloat16)
-        xm.master_print("   FSDP     : ✅ (8-chip full sharding, bf16)")
+        xm.master_print("   FSDP     : OK (8-chip full sharding, bf16)")
     elif XLA_AVAILABLE:
         model = model.to(torch.bfloat16)
 
-    # ── Optimizer ─────────────────────────────────────────────────────────────
     optimizer = Adafactor(
         model.parameters(),
-        lr=1e-3,
-        relative_step=False,
-        scale_parameter=False,
-        warmup_init=False,
-        weight_decay=0.1,
-        clip_threshold=1.0,
+        lr              = 1e-3,
+        relative_step   = False,
+        scale_parameter = False,
+        warmup_init     = False,
+        weight_decay    = 0.1,
+        clip_threshold  = 1.0,
     )
-    xm.master_print("   Optimizer: Adafactor (TPU-native, ~4× memory-efficient vs Adam)")
+    xm.master_print("   Optimizer: Adafactor (TPU-native, ~4x memory-efficient vs Adam)")
 
-    # ── Resume ────────────────────────────────────────────────────────────────
     start_step, start_phase = 0, 1
     if args.resume:
         start_step, start_phase = load_ckpt(
             model, optimizer, f"{args.ckpt_dir}/latest.pt", device
         )
 
-    # ── Dataset ───────────────────────────────────────────────────────────────
     if not Path(args.train_data).exists():
-        xm.master_print(f"\n❌ Training data not found: {args.train_data}")
-        xm.master_print("   Run: python3 prep_data.py")
+        xm.master_print(f"\nTraining data not found: {args.train_data}")
+        xm.master_print("Run: python3 prep_data.py")
         sys.exit(1)
 
     dataset = LeoDataset(args.train_data, max_seq_len=4096, pad_id=cfg.pad_id)
@@ -531,17 +384,14 @@ def main(rank=None):
         f"| vocab={cfg.vocab_size:,}"
     )
 
-    # ── Loss ──────────────────────────────────────────────────────────────────
-    loss_fn = LeoLoss(cfg)
-
-    # ── Phase selection ───────────────────────────────────────────────────────
+    loss_fn    = LeoLoss(cfg)
     all_phases = list(range(1, 9))
     phases     = [args.phase] if args.phase in all_phases else all_phases
     step       = start_step
 
     for phase in phases:
         if args.resume and phase < start_phase:
-            xm.master_print(f"  ⏭  Skip phase {phase} (already complete)")
+            xm.master_print(f"  Skip phase {phase} (already complete)")
             continue
         step = run_phase(
             phase      = phase,
@@ -559,19 +409,13 @@ def main(rank=None):
         if args.smoke:
             break
 
-    # ── Done ──────────────────────────────────────────────────────────────────
     xm.master_print(f"\n{'='*65}")
-    xm.master_print("  🎉 Leo Aether training complete!")
+    xm.master_print("  Leo Aether training complete!")
     xm.master_print(f"  Built by      : Unmuted")
     xm.master_print(f"  Architecture  : MLA + MoE + ECT + TDM + ACGI + SAM + MTP + DSA")
-    xm.master_print(f"  Anti-halluc.  : 12 layers (ECT+Brier+IDK+Const+DPO+GRPO+PRM+CUR+ACGI)")
-    xm.master_print(f"  Agentic       : tool-calling | MCP | web search | TTIP | MSRA")
-    xm.master_print(f"  Inference     : think/nothink | 128k YaRN | TDM | speculative via MTP")
     xm.master_print(f"  Next step     : python3 generate.py")
     xm.master_print(f"{'='*65}\n")
 
 
 if __name__ == "__main__":
-    # PJRT runtime (Kaggle TPU v5e-8) manages all 8 chips automatically.
-    # xmp.spawn with nprocs=8 is not supported under PJRT — call main() directly.
     main()
