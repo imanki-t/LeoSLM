@@ -101,13 +101,17 @@ class UWMRMoE(nn.Module):
         # Load-balance loss: penalize concentration of tokens in few experts
         bal_loss = self.E * (logits.softmax(-1).mean(0) ** 2).sum() * self.load_coeff
 
-        # Route tokens (XLA-compatible: loop over experts, no dynamic indexing)
+        # Route tokens — fully static shapes for XLA.
+        # Each expert runs on ALL tokens; its output is weighted by 0.0 for
+        # non-routed tokens.  No boolean masking, no dynamic tensor sizes,
+        # no host syncs.  XLA compiles this once and never recompiles.
         out = torch.zeros_like(flat)
         for ki in range(self.top_k):
             for ei in range(self.E):
-                mask = (idx[:, ki] == ei)
-                if mask.any():
-                    out[mask] += self.experts[ei](flat[mask]) * probs[mask, ki:ki+1]
+                # weight (BT, 1): probs[:,ki] where routed to expert ei, else 0.0
+                weight   = ((idx[:, ki] == ei).float() * probs[:, ki]).unsqueeze(-1)
+                expert_o = self.experts[ei](flat)   # always (BT, D) — static shape
+                out      = out + expert_o * weight
 
         # Shared experts always contribute (no gating)
         for sh in self.shared:
