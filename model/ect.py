@@ -103,9 +103,13 @@ class ECTv3Module(nn.Module):
         U     = self.score_mlp(proj).squeeze(-1).sigmoid()              # (B, T) ∈ [0,1]
 
         # ── PRM: score CoT think positions ────────────────────────────────────
+        # XLA-safe: never call .any() on a device tensor — that forces a
+        # host sync which fragments HBM.  Instead always compute PRM and
+        # multiply by the mask (0.0 outside think spans → zero cost in loss).
         prm_scores = None
-        if self.cfg.use_prm and is_think is not None and is_think.any():
+        if self.cfg.use_prm:
             prm_raw    = self.prm_head(seq_h).squeeze(-1)               # (B, T)
-            prm_scores = prm_raw * is_think.float()
+            think_w    = is_think.float() if is_think is not None else torch.ones_like(prm_raw)
+            prm_scores = prm_raw * think_w
 
         return ect_h, U, prm_scores
