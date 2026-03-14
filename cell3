@@ -1,0 +1,119 @@
+import shutil, os, numpy as np, subprocess, json
+from pathlib import Path
+
+os.chdir("/kaggle/working/LeoSLM")
+os.makedirs("data",          exist_ok=True)
+os.makedirs("leo_tokenizer", exist_ok=True)
+os.makedirs("checkpoints",   exist_ok=True)
+
+KAGGLE_USERNAME = os.environ.get("KAGGLE_USERNAME", "")
+TRAIN = Path("./data/train.npy")
+VAL   = Path("./data/val.npy")
+
+def kaggle_dataset_exists(dataset_slug):
+    r = subprocess.run(
+        ["kaggle", "datasets", "status", dataset_slug],
+        capture_output=True, text=True
+    )
+    return r.returncode == 0
+
+def download_and_unzip(dataset_slug, dest_dir):
+    os.makedirs(dest_dir, exist_ok=True)
+    r = subprocess.run(
+        ["kaggle", "datasets", "download", dataset_slug,
+         "--path", dest_dir, "--unzip"],
+        capture_output=True, text=True
+    )
+    return r.returncode == 0
+
+# ── Auto-download checkpoints (session 2+) ────────────────────────────────
+CKPT_SLUG = f"{KAGGLE_USERNAME}/leo-checkpoints"
+if kaggle_dataset_exists(CKPT_SLUG):
+    print("📦 Downloading checkpoints from Kaggle...")
+    ok = download_and_unzip(CKPT_SLUG, "./checkpoints")
+    if ok:
+        ckpts = list(Path("./checkpoints").glob("*.pt"))
+        print(f"✅ Checkpoints restored ({len(ckpts)} files) — will auto-resume")
+    else:
+        print("⚠️  Checkpoint download failed — starting fresh")
+else:
+    print("ℹ️  No checkpoints dataset yet — session 1, starting fresh")
+
+# ── Auto-download training data (session 2+) ──────────────────────────────
+DATA_SLUG = f"{KAGGLE_USERNAME}/leo-training-data"
+if not TRAIN.exists() and kaggle_dataset_exists(DATA_SLUG):
+    print("📦 Downloading training data from Kaggle (~8 GB, ~2 min)...")
+    tmp = "/kaggle/working/leo_data_dl"
+    ok  = download_and_unzip(DATA_SLUG, tmp)
+    if ok:
+        # ── MOVE not copy — avoids doubling disk usage ─────────────────────
+        for f in ["train.npy", "val.npy"]:
+            src = Path(f"{tmp}/data/{f}")
+            if src.exists():
+                shutil.move(str(src), f"./data/{f}")
+                print(f"   {f}  ({Path(f'./data/{f}').stat().st_size/1e9:.2f} GB)")
+        tok_src = Path(f"{tmp}/leo_tokenizer")
+        if tok_src.exists():
+            if Path("./leo_tokenizer").exists():
+                shutil.rmtree("./leo_tokenizer")
+            shutil.move(str(tok_src), "./leo_tokenizer")
+            print("   leo_tokenizer restored")
+        # ── Delete temp download dir immediately after move ────────────────
+        shutil.rmtree(tmp, ignore_errors=True)
+        print("   Temp download dir cleaned up")
+    else:
+        print("⚠️  Data download failed — will re-run prep")
+
+# ── Run prep if data still missing (session 1 only) ───────────────────────
+if TRAIN.exists() and VAL.exists():
+    train = np.load(str(TRAIN), mmap_mode="r")
+    val   = np.load(str(VAL),   mmap_mode="r")
+    print(f"\n✅ Data ready — skipping prep")
+    print(f"   Train: {len(train):,} tokens ({len(train)*4/1e9:.2f} GB)")
+    print(f"   Val:   {len(val):,} tokens   ({len(val)*4/1e6:.0f} MB)")
+else:
+    print("\n📦 Running full data prep — 2.1B tokens across 6 sources")
+    print("   Tokens written in chunks to disk (no RAM bottleneck)")
+    print("   Sources: FineWeb-Edu, FineMath, The Stack, OpenWebMath, Books, Wiki")
+    print("   Estimated time: ~5 hrs (unattended — you can close this tab)\n")
+
+    result = subprocess.run(["python3", "prep_data.py"], env={**os.environ})
+
+    if result.returncode == 0 and TRAIN.exists():
+        train = np.load(str(TRAIN), mmap_mode="r")
+        val   = np.load(str(VAL),   mmap_mode="r")
+        print(f"\n✅ Data prep complete!")
+        print(f"   Train: {len(train):,} tokens ({len(train)*4/1e9:.2f} GB)")
+        print(f"   Val:   {len(val):,} tokens   ({len(val)*4/1e6:.0f} MB)")
+
+        print("\n📦 Pushing training data to Kaggle Dataset...")
+        SAVE_DIR = "/kaggle/working/leo_data_save"
+        os.makedirs(f"{SAVE_DIR}/data",          exist_ok=True)
+        os.makedirs(f"{SAVE_DIR}/leo_tokenizer", exist_ok=True)
+        # ── Symlink instead of copy to save disk space ─────────────────────
+        for f in ["train.npy", "val.npy"]:
+            src = Path(f"./data/{f}")
+            dst = Path(f"{SAVE_DIR}/data/{f}")
+            if src.exists() and not dst.exists():
+                os.symlink(src.resolve(), dst)
+        if Path("./leo_tokenizer").exists():
+            shutil.copytree("./leo_tokenizer", f"{SAVE_DIR}/leo_tokenizer",
+                            dirs_exist_ok=True)
+        Path(f"{SAVE_DIR}/dataset-metadata.json").write_text(json.dumps({
+            "title": "leo-training-data",
+            "id": DATA_SLUG,
+            "licenses": [{"name": "CC0-1.0"}]
+        }))
+        r = subprocess.run(
+            ["kaggle", "datasets", "create", "-p", SAVE_DIR, "--dir-mode", "zip"],
+            capture_output=True, text=True
+        )
+        if r.returncode != 0:
+            subprocess.run(
+                ["kaggle", "datasets", "version", "-p", SAVE_DIR,
+                 "-m", "data prep complete", "--dir-mode", "zip"],
+                capture_output=True, text=True
+            )
+        print(f"✅ leo-training-data pushed — future sessions auto-download it")
+    else:
+        print("❌ prep_data.py failed — scroll up for error")
