@@ -2,13 +2,7 @@ import os
 os.environ["XLA_USE_BF16"]                  = "1"
 os.environ["XLA_TENSOR_ALLOCATOR_MAXSIZE"]  = "1000000000"
 os.environ["PJRT_DEVICE"]                   = "TPU"
-os.environ["XLA_FLAGS"]                     = (
-    "--xla_tpu_enable_async_collective_fusion=true "
-    "--xla_tpu_enable_async_collective_fusion_fuse_all_gather=true "
-    "--xla_tpu_enable_async_collective_fusion_multiple_steps=true "
-    "--xla_tpu_overlap_compute_collective_tc=true "
-    "--xla_enable_async_all_gather=true"
-)
+os.environ.pop("XLA_FLAGS", None)
 
 import sys
 import math
