@@ -439,11 +439,13 @@ def main(rank=None):
     cfg   = LeoConfig()
     model = LeoSLM(cfg).to(device)
 
-    if XLA_AVAILABLE:
-        model = model.to(torch.bfloat16)
     if XLA_AVAILABLE and FSDP is not None:
-        model = FSDP(model, compute_dtype=torch.bfloat16, reshard_after_forward=True)
-        xm.master_print("   FSDP     : ✅ (8-chip full sharding)")
+        # XlaFSDP only supports fp32 parameters — wrap first, then cast to bf16
+        model = FSDP(model, reshard_after_forward=True)
+        model = model.to(torch.bfloat16)
+        xm.master_print("   FSDP     : ✅ (8-chip full sharding, bf16)")
+    elif XLA_AVAILABLE:
+        model = model.to(torch.bfloat16)
 
     pc = model.count_params()
     xm.master_print(f"   Params   : {pc['total']/1e9:.2f}B total "
