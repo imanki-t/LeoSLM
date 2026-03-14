@@ -1,60 +1,70 @@
-"""
-data/dataset.py — LeoDataset
-==============================
-Memory-mapped uint32 dataset with curriculum-aware sequence length.
-
-LeoTokenizer vocab size 65543 exceeds uint16 max (65535), so the
-tokenised corpus is stored as uint32 (.npy files, 4 bytes/token).
-
-The dataset supports Progressive Confidence Curriculum (PCC): each
-training phase calls set_seq_len() to increase the context window
-from 4k → 8k → 16k → 32k without reloading data from disk.
-"""
-
 import numpy as np
 import torch
 from torch.utils.data import Dataset
+from pathlib import Path
 from typing import Dict
 
 
 class LeoDataset(Dataset):
-    """
-    Memory-mapped, curriculum-length dataset.
-
-    Args:
-        path       : path to uint32 .npy token file
-        max_seq_len: initial sequence length (updated per phase via set_seq_len)
-        pad_id     : pad token id (default: LeoConfig.pad_id = 65529)
-    """
-
     def __init__(
         self,
-        path:        str,
+        data_path: str,
         max_seq_len: int = 4096,
-        pad_id:      int = 65529,
+        pad_id: int = 65529,
     ):
-        self.data     = np.load(path, mmap_mode="r")
-        self.max_len  = max_seq_len
-        self.pad_id   = pad_id
-        self.n_chunks = max(1, len(self.data) // max_seq_len)
+        path = Path(data_path)
+        if not path.exists():
+            raise FileNotFoundError(f"Training data not found: {data_path}")
 
-    def set_seq_len(self, n: int):
-        """Update sequence length for the next training phase (PCC)."""
-        self.max_len  = n
-        self.n_chunks = max(1, len(self.data) // n)
+        raw = np.load(data_path, mmap_mode="r")
+        self.data    = raw.astype(np.int32)
+        self.seq_len = max_seq_len
+        self.pad_id  = pad_id
+        self._n      = max(1, (len(self.data) - 1) // max_seq_len)
+
+    def set_seq_len(self, seq_len: int) -> None:
+        self.seq_len = seq_len
+        self._n      = max(1, (len(self.data) - 1) // seq_len)
 
     def __len__(self) -> int:
-        return self.n_chunks
+        return self._n
 
     def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
-        s     = idx * self.max_len
-        chunk = self.data[s: s + self.max_len].astype(np.int64)
-
-        # Pad if last chunk is shorter than max_len
-        if len(chunk) < self.max_len:
-            pad   = np.full(self.max_len - len(chunk), self.pad_id, dtype=np.int64)
+        start = (idx * self.seq_len) % max(1, len(self.data) - self.seq_len - 1)
+        chunk = self.data[start : start + self.seq_len + 1]
+        L     = len(chunk)
+        if L < self.seq_len + 1:
+            pad = np.full(self.seq_len + 1 - L, self.pad_id, dtype=np.int32)
             chunk = np.concatenate([chunk, pad])
+        ids = torch.from_numpy(chunk[: self.seq_len + 1].copy()).long()
+        return {"input_ids": ids[:-1], "labels": ids[1:]}
 
-        ids  = torch.tensor(chunk, dtype=torch.long)
-        mask = (ids != self.pad_id).long()
-        return {"input_ids": ids, "attention_mask": mask}
+
+class LeoStreamDataset(Dataset):
+    def __init__(
+        self,
+        data_path: str,
+        max_seq_len: int = 4096,
+        pad_id: int = 65529,
+        stride: int = 0,
+    ):
+        self.data    = np.load(data_path, mmap_mode="r").astype(np.int32)
+        self.seq_len = max_seq_len
+        self.pad_id  = pad_id
+        self.stride  = stride if stride > 0 else max_seq_len
+
+    def set_seq_len(self, seq_len: int) -> None:
+        self.seq_len = seq_len
+
+    def __len__(self) -> int:
+        return max(1, (len(self.data) - self.seq_len) // self.stride)
+
+    def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
+        start = idx * self.stride
+        chunk = self.data[start : start + self.seq_len + 1]
+        L     = len(chunk)
+        if L < self.seq_len + 1:
+            pad   = np.full(self.seq_len + 1 - L, self.pad_id, dtype=np.int32)
+            chunk = np.concatenate([chunk, pad])
+        ids = torch.from_numpy(chunk[: self.seq_len + 1].copy()).long()
+        return {"input_ids": ids[:-1], "labels": ids[1:]}

@@ -1,2 +1,3 @@
-from .dataset import LeoDataset
-__all__ = ["LeoDataset"]
+from .dataset import LeoDataset, LeoStreamDataset
+
+__all__ = ["LeoDataset", "LeoStreamDataset"]
