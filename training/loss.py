@@ -43,14 +43,15 @@ class LeoLoss(nn.Module):
     # ── Core loss terms ───────────────────────────────────────────────────────
 
     def ar_loss(self, logits: torch.Tensor, ids: torch.Tensor) -> torch.Tensor:
-        """Standard next-token cross-entropy, ignoring pad positions."""
+        """Standard next-token cross-entropy, ignoring pad positions.
+        XLA-safe: weighted sum instead of boolean indexing (no dynamic shapes,
+        no host sync guard clause)."""
         B, T, V = logits.shape
         l = logits[:, :-1].contiguous().view(-1, V)
         t = ids[:, 1:].contiguous().view(-1)
-        m = (t != self.cfg.pad_id)
-        if m.sum() == 0:
-            return logits.new_zeros(1)
-        return F.cross_entropy(l[m], t[m])
+        m = (t != self.cfg.pad_id).float()
+        n = m.sum().clamp(min=1)
+        return (F.cross_entropy(l, t, reduction="none") * m).sum() / n
 
     def mdm_loss(
         self,
@@ -68,10 +69,10 @@ class LeoLoss(nn.Module):
         target[~mask_m] = self.cfg.pad_id
         l = diff_logits.view(-1, V)
         t = target.view(-1)
-        v = (t != self.cfg.pad_id)
-        if v.sum() == 0:
-            return diff_logits.new_zeros(1)
-        return F.cross_entropy(l[v], t[v])
+        # XLA-safe: weighted CE avoids dynamic boolean indexing + host sync guard
+        v = (t != self.cfg.pad_id).float()
+        n = v.sum().clamp(min=1)
+        return (F.cross_entropy(l, t, reduction="none") * v).sum() / n
 
     def brier_loss(
         self,
@@ -107,14 +108,13 @@ class LeoLoss(nn.Module):
         u      = U[:, :-1]
         l      = logits[:, :-1]
         high_u = (u > self.cfg.uncertainty_thresh).float()
-        if high_u.sum() == 0:
-            return l.new_zeros(1)
-        idk_tgt         = torch.full_like(t, self.cfg.pad_id)
-        idk_tgt[high_u.bool()] = self.cfg.idk_id
-        v = (idk_tgt != self.cfg.pad_id)
-        if v.sum() == 0:
-            return l.new_zeros(1)
-        return F.cross_entropy(l.view(-1, V)[v.view(-1)], idk_tgt.view(-1)[v.view(-1)])
+        # XLA-safe: build soft IDK target then weighted CE — no guards, no bool indexing.
+        # Positions with high_u=0 get target=pad which the mask zeroes out below.
+        idk_tgt = (t * (1 - high_u.long()) + self.cfg.idk_id * high_u.long())
+        v = high_u  # weight is 1.0 for high-U positions, 0.0 elsewhere
+        n = v.sum().clamp(min=1)
+        ce = F.cross_entropy(l.view(-1, V), idk_tgt.view(-1), reduction="none")
+        return (ce * v.view(-1)).sum() / n
 
     def ses_loss(self, model: nn.Module) -> torch.Tensor:
         """
@@ -163,9 +163,10 @@ class LeoLoss(nn.Module):
                 break
             l = logits[:, :-offset].contiguous().view(-1, logits.size(-1))
             t = ids[:, offset:].contiguous().view(-1)
-            m = (t != self.cfg.pad_id)
-            if m.sum() > 0:
-                total = total + F.cross_entropy(l[m], t[m])
+            # XLA-safe: weighted CE — no dynamic boolean indexing
+            m = (t != self.cfg.pad_id).float()
+            n = m.sum().clamp(min=1)
+            total = total + (F.cross_entropy(l, t, reduction="none") * m).sum() / n
         return total / max(len(mtp_logits), 1)
 
     def prm_loss(
@@ -173,15 +174,15 @@ class LeoLoss(nn.Module):
         prm_scores: Optional[torch.Tensor],
         think_mask: torch.Tensor,
     ) -> torch.Tensor:
-        """
-        PRM calibration: smooth quality estimates across think steps.
-        Low variance = stable step-level scores = reliable PRM.
-        """
-        if prm_scores is None or think_mask.sum() == 0:
-            ref = prm_scores if prm_scores is not None else think_mask
-            return ref.new_zeros(1)
-        think_scores = prm_scores[think_mask]
-        return think_scores.var() * 0.1
+        """PRM calibration — XLA-safe: always compute, mask out non-think positions."""
+        if prm_scores is None:
+            return think_mask.new_zeros(1, dtype=torch.float)
+        # Weighted variance over think tokens — no .sum()==0 host sync guard needed.
+        w = think_mask.float()
+        n = w.sum().clamp(min=1)
+        mean  = (prm_scores * w).sum() / n
+        var   = ((prm_scores - mean) ** 2 * w).sum() / n
+        return var * 0.1
 
     def acgi_loss(
         self,
@@ -190,19 +191,21 @@ class LeoLoss(nn.Module):
         tool_logits: Optional[torch.Tensor] = None,
         tool_labels: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        """
-        ACGI gate calibration BCE + optional tool routing CE.
-        Gate should fire exactly when U > acgi_threshold.
-        """
+        """ACGI gate calibration BCE + optional tool routing CE.
+        XLA-safe: no .any() host sync; weighted CE for tool routing."""
         target = (U > self.cfg.acgi_threshold).float()
         l_gate = F.binary_cross_entropy(gate_score.clamp(1e-6, 1 - 1e-6), target)
         l_tool = gate_score.new_zeros(1)
         if tool_logits is not None and tool_labels is not None:
             flat_l = tool_logits.view(-1, tool_logits.size(-1))
             flat_t = tool_labels.view(-1)
-            valid  = flat_t >= 0
-            if valid.any():
-                l_tool = F.cross_entropy(flat_l[valid], flat_t[valid])
+            # XLA-safe: replace .any() + boolean index with soft weight
+            valid  = (flat_t >= 0).float()
+            n      = valid.sum().clamp(min=1)
+            # Use ignore_index=-1 so CE ignores label=-1 positions natively
+            l_tool = F.cross_entropy(flat_l, flat_t.clamp(min=0),
+                                     reduction="none")
+            l_tool = (l_tool * valid).sum() / n
         return l_gate + 0.5 * l_tool
 
     def msra_loss(
@@ -219,9 +222,10 @@ class LeoLoss(nn.Module):
         """
         tool_mask = out.get("tool_mask")
         U         = out.get("uncertainty")
-        if tool_mask is None or U is None or tool_mask.sum() == 0:
+        if tool_mask is None or U is None:
             ref = U if U is not None else ids
             return ref.new_zeros(1, dtype=torch.float)
+        # XLA-safe: always compute, mask zeroes out non-tool positions — no .sum()==0 guard
         tool_u = (U * tool_mask.float()).sum() / tool_mask.float().sum().clamp(min=1)
         return tool_u * 0.1
 
