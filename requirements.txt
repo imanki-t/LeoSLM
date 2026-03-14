@@ -1,7 +1,48 @@
-torch>=2.0.0
-transformers>=4.38.0
-datasets>=2.18.0
-sentencepiece>=0.1.99
+# ─────────────────────────────────────────────────────────────────────────────
+# LeoSLM "Aether" — requirements.txt
+# Built by Unmuted
+# Install: pip install -r requirements.txt
+# ─────────────────────────────────────────────────────────────────────────────
+
+# ── Core ──────────────────────────────────────────────────────────────────────
+torch>=2.1.0
 numpy>=1.24.0
 tqdm>=4.66.0
 pyyaml>=6.0
+
+# ── HuggingFace ────────────────────────────────────────────────────────────────
+transformers>=4.40.0          # tokenizer, Adafactor, PreTrainedTokenizerFast
+datasets>=2.18.0              # data streaming from HuggingFace Hub
+tokenizers>=0.19.0            # BPE tokenizer training (prep_data.py)
+
+# ── TPU (Kaggle TPU v5e-8) ────────────────────────────────────────────────────
+# torch_xla is pre-installed on Kaggle TPU instances.
+# If running locally without TPU, these lines are ignored gracefully.
+# torch_xla>=2.1.0            # uncomment if installing manually on a TPU VM
+
+# ── RAG / Knowledge layer (leo_rag.py) — all optional ────────────────────────
+# Install only the backend you want to use:
+
+# Vector stores (pick one):
+# chromadb>=0.4.0             # recommended default: pip install chromadb
+# faiss-cpu>=1.7.4            # faster for large indexes: pip install faiss-cpu
+
+# Embeddings (for semantic search):
+# sentence-transformers>=2.7.0  # pip install sentence-transformers
+
+# Web search tool (built-in stub uses this if available):
+# duckduckgo-search>=5.0.0    # pip install duckduckgo-search
+
+# Document parsing (DocumentIndexer):
+# pypdf>=4.0.0                # PDFs:  pip install pypdf
+# python-docx>=1.1.0          # .docx: pip install python-docx
+# beautifulsoup4>=4.12.0      # HTML:  pip install beautifulsoup4
+
+# ── Evaluation extras ─────────────────────────────────────────────────────────
+scikit-learn>=1.3.0           # AUROC computation in eval/evaluate.py
+# mauve-text>=0.3.0           # optional MAUVE score: pip install mauve-text
+
+# ── Dev / notebook ────────────────────────────────────────────────────────────
+# jupyter>=1.0.0
+# matplotlib>=3.7.0
+# pandas>=2.0.0
