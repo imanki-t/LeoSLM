@@ -247,7 +247,7 @@ def _get_engine(checkpoint: Optional[str] = None) -> LeoGenerationEngine:
 
     tok          = _load_tokenizer()
     personality  = PersonalityConfig.load()
-    knowledge    = LeoKnowledgeLayer()
+    knowledge    = LeoKnowledgeLayer.from_config("./config/leo_config.yaml")
     safety_filt  = OutputSafetyFilter()
 
     _STATE["engine"] = LeoGenerationEngine(
