@@ -260,39 +260,41 @@ class LeoLoss(nn.Module):
         l_moe = out["aux_loss"].mean()
 
         total = l_ar + cfg.loss_w_ect * l_ect + cfg.loss_w_moe * l_moe
+        # NOTE: raw tensors — NO .item() here.  train.py materialises scalars
+        # only at logging/checkpoint intervals to avoid per-step XLA host syncs.
         m     = {
-            "l_ar":  l_ar.item(),
-            "l_ect": l_ect.item(),
-            "l_moe": l_moe.item(),
+            "l_ar":  l_ar,
+            "l_ect": l_ect,
+            "l_moe": l_moe,
         }
 
         # ── Phase 2+: diffusion loss ───────────────────────────────────────────
         if phase >= 2 and self.lambda_mdm > 0:
             l_mdm  = self.mdm_loss(out["diff_logits"], ids)
             total  = total + self.lambda_mdm * l_mdm
-            m["l_mdm"] = l_mdm.item()
+            m["l_mdm"] = l_mdm
 
         # ── Phase 3+: IDK + SES + MTP ─────────────────────────────────────────
         if phase >= 3:
             l_idk  = self.idk_loss(out["ar_logits"], out["uncertainty"], ids)
             total  = total + cfg.loss_w_idk * l_idk
-            m["l_idk"] = l_idk.item()
+            m["l_idk"] = l_idk
 
             if model is not None:
                 l_ses  = self.ses_loss(model)
                 total  = total + cfg.loss_w_ses * l_ses
-                m["l_ses"] = l_ses.item()
+                m["l_ses"] = l_ses
 
             if out.get("mtp_logits") is not None:
                 l_mtp  = self.mtp_loss(out["mtp_logits"], ids)
                 total  = total + cfg.loss_w_mtp * l_mtp
-                m["l_mtp"] = l_mtp.item()
+                m["l_mtp"] = l_mtp
 
         # ── Phase 4+: PRM ──────────────────────────────────────────────────────
         if phase >= 4 and out.get("prm_scores") is not None:
             l_prm  = self.prm_loss(out["prm_scores"], out["think_mask"])
             total  = total + cfg.loss_w_prm * l_prm
-            m["l_prm"] = l_prm.item()
+            m["l_prm"] = l_prm
 
         # ── Phase 7+: ACGI + MSRA ─────────────────────────────────────────────
         if phase >= 7:
@@ -302,8 +304,8 @@ class LeoLoss(nn.Module):
             )
             l_msra = self.msra_loss(out, ids)
             total  = total + cfg.loss_w_acgi * l_acgi + cfg.loss_w_msra * l_msra
-            m["l_acgi"] = l_acgi.item()
-            m["l_msra"] = l_msra.item()
+            m["l_acgi"] = l_acgi
+            m["l_msra"] = l_msra
 
-        m["total"] = total.item()
+        m["total"] = total
         return total, m

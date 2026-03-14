@@ -69,7 +69,7 @@ class GRPOTrainer:
         +1.0 if exactly one valid <think>…</think> block (close > open + 4 tokens).
         0.0 otherwise (no block, multiple blocks, or unclosed).
         """
-        lst    = ids.tolist()
+        lst    = ids.cpu().tolist()   # .cpu() avoids XLA device→host sync stall
         opens  = lst.count(self.think_start)
         closes = lst.count(self.think_end)
         if opens == 1 and closes == 1:
@@ -81,7 +81,7 @@ class GRPOTrainer:
 
     def _think_length_penalty(self, ids: torch.Tensor) -> float:
         """Mild efficiency penalty: -0.001 per think token."""
-        lst = ids.tolist()
+        lst = ids.cpu().tolist()      # .cpu() avoids XLA device→host sync stall
         if self.think_start not in lst or self.think_end not in lst:
             return 0.0
         s = lst.index(self.think_start)
@@ -98,12 +98,12 @@ class GRPOTrainer:
         Low uncertainty = confident answer = less likely to be a hallucination.
         """
         U       = model_out["uncertainty"][0]
-        lst     = ids[0].tolist() if ids.dim() > 1 else ids.tolist()
+        lst     = (ids[0].cpu() if ids.dim() > 1 else ids.cpu()).tolist()
         if self.think_end in lst:
             end_idx  = lst.index(self.think_end)
-            answer_U = U[end_idx + 1:].mean().item()
+            answer_U = U[end_idx + 1:].mean().cpu().item()
         else:
-            answer_U = U.mean().item()
+            answer_U = U.mean().cpu().item()
         return max(0.0, 1.5 - answer_U * 3.0)
 
     def compute_rewards(
@@ -170,11 +170,12 @@ class GRPOTrainer:
         )
 
         total = grpo_loss + self.kl_coeff * kl_loss + 0.5 * ar_l
+        # Return raw tensors — train.py calls .item() only at log intervals
         return {
             "total": total,
-            "grpo":  grpo_loss.item(),
-            "kl":    kl_loss.item(),
-            "ar":    ar_l.item(),
+            "grpo":  grpo_loss,
+            "kl":    kl_loss,
+            "ar":    ar_l,
         }
 
 
@@ -214,7 +215,7 @@ class AgenticGRPO:
         Rule-based reward over a full agentic trajectory.
         Scores: think format, tool format, tool execution, answer confidence.
         """
-        lst = ids.tolist()
+        lst = ids.cpu().tolist()   # .cpu() — one clean transfer, no stall loop
         r   = 0.0
 
         # Think block format
@@ -235,10 +236,10 @@ class AgenticGRPO:
 
         # Answer quality: low ECT uncertainty after tool results
         U  = model_out["uncertainty"][0]
-        tl = ids[0].tolist() if ids.dim() > 1 else lst
+        tl = (ids[0].cpu() if ids.dim() > 1 else ids.cpu()).tolist()
         if self.cfg.tool_result_end in tl:
             end_idx  = len(tl) - 1 - tl[::-1].index(self.cfg.tool_result_end)
-            answer_U = U[end_idx + 1:].mean().item() if end_idx + 1 < len(U) else 1.0
+            answer_U = U[end_idx + 1:].mean().cpu().item() if end_idx + 1 < len(U) else 1.0
             r       += max(0.0, 2.0 - answer_U * 4.0)
 
         return r
@@ -292,9 +293,10 @@ class AgenticGRPO:
         kl         = F.kl_div(ref_lp, log_probs.exp(), reduction="batchmean")
         loss       = -(adv * tgt_lp.mean()) + self.kl_coeff * kl
 
+        # Return raw tensors — train.py calls .item() only at log intervals
         return {
             "total":  loss,
             "reward": reward,
-            "kl":     kl.item(),
-            "l_msra": loss.item(),
+            "kl":     kl,
+            "l_msra": loss,
         }
