@@ -524,7 +524,6 @@ def main(rank=None):
 
 
 if __name__ == "__main__":
-    if XLA_AVAILABLE:
-        xmp.spawn(main, args=(), nprocs=8, start_method="fork")
-    else:
-        main()
+    # PJRT runtime (Kaggle TPU v5e-8) manages all 8 chips automatically.
+    # xmp.spawn with nprocs=8 is not supported under PJRT — call main() directly.
+    main()
