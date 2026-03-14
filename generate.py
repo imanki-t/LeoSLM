@@ -250,7 +250,7 @@ class LeoGenerator:
                 tok_id  = sample_token(logits, temperature, top_k, top_p)
                 ids     = torch.cat([ids, tok_id], dim=1)
                 all_unc.append(U)
-                if tok_id.item() in stop_ids:
+                if tok_id.cpu().item() in stop_ids:
                     break
 
                 # Try to accept draft tokens
@@ -261,17 +261,17 @@ class LeoGenerator:
                     v_U       = verify["uncertainty"][:, -1]
                     expected  = v_logits.argmax(-1, keepdim=True)
 
-                    if expected.item() == draft_tok.item():
+                    if expected.cpu().item() == draft_tok.cpu().item():
                         ids     = torch.cat([ids, draft_tok], dim=1)
                         all_unc.append(v_U)
-                        if draft_tok.item() in stop_ids:
+                        if draft_tok.cpu().item() in stop_ids:
                             break
                     else:
                         # Reject: sample from verified distribution instead
                         corrected = sample_token(v_logits, temperature, top_k, top_p)
                         ids       = torch.cat([ids, corrected], dim=1)
                         all_unc.append(v_U)
-                        if corrected.item() in stop_ids:
+                        if corrected.cpu().item() in stop_ids:
                             break
                         break   # Stop speculative run on rejection
                 else:
@@ -283,7 +283,7 @@ class LeoGenerator:
                 tok_id = sample_token(logits, temperature, top_k, top_p)
                 ids    = torch.cat([ids, tok_id], dim=1)
                 all_unc.append(U)
-                if tok_id.item() in stop_ids:
+                if tok_id.cpu().item() in stop_ids:
                     break
 
             if XLA_AVAILABLE:
@@ -361,7 +361,7 @@ class LeoGenerator:
                                                   stop_at=stop, use_mtp=use_mtp)
 
         # Close think block if needed
-        last = think_ids[0, -1].item()
+        last = think_ids[0, -1].cpu().item()
         if last != self.cfg.think_end_id:
             end_tok  = torch.tensor([[self.cfg.think_end_id]], device=self.device)
             think_ids = torch.cat([think_ids, end_tok], dim=1)

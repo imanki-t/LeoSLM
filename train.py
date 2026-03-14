@@ -357,31 +357,40 @@ def run_phase(
                     optimizer.step()
                 optimizer.zero_grad()
 
-            # ── Logging ────────────────────────────────────────────────────────
-            loss_val = loss.item() if isinstance(loss, torch.Tensor) else loss
-            ep_loss += metrics.get("total", loss_val)
-            nb      += 1
-            step    += 1
+            # ── Logging + Checkpoint (deferred .item() — XLA sync only here) ──
+            nb   += 1
+            step += 1
 
-            if step % 10 == 0:
+            _do_log  = (step % 10        == 0)
+            _do_ckpt = (step % save_every == 0)
+
+            if _do_log or _do_ckpt:
+                # Materialise scalars once per interval, not every step.
+                # This is the ONLY place we sync XLA device→host for metrics.
+                loss_val = loss.item() if isinstance(loss, torch.Tensor) else loss
+                m_cpu    = {k: (v.item() if isinstance(v, torch.Tensor) else v)
+                            for k, v in metrics.items()}
+                ep_loss += m_cpu.get("total", loss_val)
+
+            if _do_log:
                 extra = ""
                 for key in ("l_mtp", "l_acgi", "l_msra", "reward", "l_idk", "l_ect"):
-                    if key in metrics:
-                        extra += f" {key}={metrics[key]:.3f}"
+                    if key in m_cpu:
+                        extra += f" {key}={m_cpu[key]:.3f}"
                 xm.master_print(
                     f"  p{phase} e{epoch+1} s{step:6d} | "
-                    f"loss={metrics.get('total', loss_val):.3f} "
-                    f"ar={metrics.get('l_ar', 0):.3f}"
+                    f"loss={m_cpu.get('total', loss_val):.3f} "
+                    f"ar={m_cpu.get('l_ar', 0):.3f}"
                     f"{extra} lr={lr:.2e} | {time.time()-t0:.0f}s"
                 )
 
             # ── Checkpoint ────────────────────────────────────────────────────
-            if step % save_every == 0:
+            if _do_ckpt:
                 save_ckpt(model, optimizer, step, phase,
-                          metrics.get("total", loss_val),
+                          m_cpu.get("total", loss_val),
                           f"{ckpt_dir}/phase{phase}_step{step}.pt")
                 save_ckpt(model, optimizer, step, phase,
-                          metrics.get("total", loss_val),
+                          m_cpu.get("total", loss_val),
                           f"{ckpt_dir}/latest.pt")
 
             if smoke and step >= start_step + 50:
@@ -439,6 +448,14 @@ def main(rank=None):
     cfg   = LeoConfig()
     model = LeoSLM(cfg).to(device)
 
+    # count_params() BEFORE FSDP — after sharding each chip only holds 1/8th
+    # of the params so numel() returns near-zero on each rank.
+    pc = model.count_params()
+    xm.master_print(f"   Params   : {pc['total']/1e9:.2f}B total "
+                    f"| ~{pc['approx_active']/1e9:.2f}B active (MoE)")
+    xm.master_print(f"   MTP(N={cfg.mtp_n}) | DSA(>{cfg.dsa_threshold//1024}k) "
+                    f"| ACGI(τ={cfg.acgi_threshold}) | SAM(M={cfg.sam_memory_size})")
+
     if XLA_AVAILABLE and FSDP is not None:
         # XlaFSDP only supports fp32 parameters — wrap first, then cast to bf16
         model = FSDP(model, reshard_after_forward=True)
@@ -446,12 +463,6 @@ def main(rank=None):
         xm.master_print("   FSDP     : ✅ (8-chip full sharding, bf16)")
     elif XLA_AVAILABLE:
         model = model.to(torch.bfloat16)
-
-    pc = model.count_params()
-    xm.master_print(f"   Params   : {pc['total']/1e9:.2f}B total "
-                    f"| ~{pc['approx_active']/1e9:.2f}B active (MoE)")
-    xm.master_print(f"   MTP(N={cfg.mtp_n}) | DSA(>{cfg.dsa_threshold//1024}k) "
-                    f"| ACGI(τ={cfg.acgi_threshold}) | SAM(M={cfg.sam_memory_size})")
 
     # ── Optimizer ─────────────────────────────────────────────────────────────
     optimizer = Adafactor(
