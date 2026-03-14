@@ -1,37 +1,3 @@
-"""
-model/leo_slm.py — LeoSLM "Aether" — Full Model Assembly
-==========================================================
-~3.1B total parameters | ~1.9B active (MoE) | 32k trained | 128k via YaRN
-
-Architecture (Aether):
-    Input tokens
-        → Embedding (65543 × 2560)
-        → Initial ECT pass   — seeds U before transformer blocks
-        → SAM prefix         — structured agentic memory slots
-        → 32 × LeoBlock
-            ├─ MLA dual-path attention (causal + bidir, gated by α)
-            ├─ UWMR MoE FFN (blocks 4-31) / Dense SwiGLU (blocks 0-3)
-            └─ TDM rolling memory compression at each chunk boundary
-        → Final ECT pass     — produces U_final across full sequence
-        → ACGI               — per-token tool-call gate
-        → RMSNorm
-        → AR head  (lm_head, weight-tied to embedding)
-        → Diff head (diff_head, separate weights)
-        → MTP heads (N=4 future positions, optional)
-
-V1 features merged into Aether:
-    _noise_embedding()        — sinusoidal diffusion timestep embedding (v1)
-    get_inference_output()    — hybrid AR/diffusion inference helper (v1)
-    count_params_detailed()   — per-component parameter breakdown (v1)
-    alpha_list in output dict — per-layer gate values for analysis (v1)
-    denoise_head alias        — diff_head aliased as denoise_head for compat (v1)
-    HardThresholdGate         — thresholded uncertain-token mask (v1)
-
-Imports:
-    All components imported from their own module files.
-    No class definitions live here except LeoSLM itself.
-"""
-
 import math
 import torch
 import torch.nn as nn
@@ -41,400 +7,240 @@ from typing import Dict, List, Optional, Tuple
 from .config    import LeoConfig, CFG
 from .identity  import LEO_IDENTITY
 from .norm      import RMSNorm
+from .rope      import build_yarn_rope_cache
 from .ect       import ECTv3Module
 from .memory    import TemporalDiffusionMemory, StructuredAgenticMemory
-from .attention import DSALite
-from .moe       import ExpertFFN
+from .moe       import UWMRMoE
 from .mtp       import MultiTokenPredictionHead
 from .agentic   import AgenticConfidenceGatedInvocation
 from .leo_block import LeoBlock
+from .attention import DSALite
 
-
-# ── V1 compatibility helper ────────────────────────────────────────────────────
 
 class HardThresholdGate:
-    """
-    V1 inference helper: binary mask for uncertain token positions.
-    Tokens with U > threshold are flagged for diffusion refinement.
-    """
-
-    def __init__(self, threshold: float = 0.35):
+    def __init__(self, threshold: float = 0.5):
         self.threshold = threshold
 
-    def get_uncertain_positions(
-        self,
-        uncertainty: torch.Tensor,
-        input_ids:   torch.Tensor,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """
-        Returns:
-            flagged   : (B, T) bool — True = uncertain → use diffusion logits
-            threshold : float
-        """
-        flagged = uncertainty > self.threshold
-        return flagged, self.threshold
+    def __call__(self, U: torch.Tensor) -> torch.Tensor:
+        return (U > self.threshold).float()
 
-
-# ══════════════════════════════════════════════════════════════════════════════
-# LeoSLM — Full Model
-# ══════════════════════════════════════════════════════════════════════════════
 
 class LeoSLM(nn.Module):
-    """
-    LeoSLM "Aether" — built by Unmuted.
-
-    Forward pass returns a dict with:
-        ar_logits     : (B, T, V)         — AR head logits
-        diff_logits   : (B, T, V)         — diffusion / denoise head logits
-        uncertainty   : (B, T)            — ECT uncertainty ∈ [0,1]
-        hidden        : (B, T, D)         — final hidden states (pre-norm)
-        aux_loss      : scalar            — MoE + TDM + SAM auxiliary losses
-        prm_scores    : (B, T) | None     — CoT step quality scores
-        think_mask    : (B, T) bool       — positions inside <think>…</think>
-        tool_mask     : (B, T) bool       — positions inside tool-call spans
-        acgi_gate     : (B, T)            — ACGI gate scores
-        acgi_gate_mask: (B, T) bool       — ACGI hard gate (True = invoke tool)
-        tool_logits   : (B, T, n_tools)   — tool routing logits
-        mtp_logits    : List[(B, T, V)]   — N future-token predictions (phase 3+)
-        alpha_list    : List[(B, T)]      — per-layer gate values (v1 compat)
-
-    Args:
-        cfg : LeoConfig (default: module-level CFG singleton)
-    """
 
     def __init__(self, cfg: LeoConfig = CFG):
         super().__init__()
-        self.cfg      = cfg
-        self.identity = LEO_IDENTITY
-        D, V          = cfg.hidden_dim, cfg.vocab_size
+        self.cfg = cfg
+        D = cfg.hidden_dim
 
-        # ── Embedding ─────────────────────────────────────────────────────────
-        self.tok_embed  = nn.Embedding(V, D)
+        assert D % cfg.num_heads == 0, (
+            f"hidden_dim {D} must be divisible by num_heads {cfg.num_heads}"
+        )
 
-        # ── Epistemic Confidence Tokens ────────────────────────────────────────
-        self.ect        = ECTv3Module(cfg)
-
-        # ── Temporal Diffusion Memory ──────────────────────────────────────────
-        self.tdm        = TemporalDiffusionMemory(cfg)
-
-        # ── Decoder blocks ─────────────────────────────────────────────────────
+        self.embed      = nn.Embedding(cfg.vocab_size, D)
         self.blocks     = nn.ModuleList([LeoBlock(cfg, i) for i in range(cfg.num_layers)])
-
-        # ── Final norm + output heads ─────────────────────────────────────────
         self.final_norm = RMSNorm(D)
-        self.lm_head    = nn.Linear(D, V, bias=False)
-        self.diff_head  = nn.Linear(D, V, bias=False)
 
-        # V1 alias: denoise_head → diff_head (keeps old checkpoints loadable)
+        self.lm_head  = nn.Linear(D, cfg.vocab_size, bias=False)
+        self.lm_head.weight = self.embed.weight
+
+        self.diff_head    = nn.Linear(D, cfg.vocab_size, bias=False)
         self.denoise_head = self.diff_head
 
-        # ── V1: HardThresholdGate for hybrid inference ─────────────────────────
-        self.hard_gate  = HardThresholdGate(threshold=cfg.uncertainty_thresh)
+        self.ect  = ECTv3Module(cfg)
+        self.acgi = AgenticConfidenceGatedInvocation(cfg)
 
-        # ── Multi-Token Prediction ─────────────────────────────────────────────
+        self.tdm = TemporalDiffusionMemory(cfg)   if cfg.use_tdm else None
+        self.sam = StructuredAgenticMemory(cfg)   if cfg.use_sam else None
+        self.dsa = DSALite(cfg)                   if cfg.use_dsa else None
+
         if cfg.use_mtp:
-            self.mtp    = MultiTokenPredictionHead(cfg)
-
-        # ── DSA-lite (sparse attention for >32k contexts) ──────────────────────
-        self.dsa        = DSALite(cfg)
-
-        # ── ACGI: Agentic Confidence-Gated Invocation ──────────────────────────
-        self.acgi       = AgenticConfidenceGatedInvocation(cfg)
-
-        # ── SAM: Structured Agentic Memory ─────────────────────────────────────
-        if cfg.use_sam:
-            self.sam    = StructuredAgenticMemory(cfg)
-
-        # ── Weight tying ─────────────────────────────────────────────────────
-        if cfg.weight_tying:
-            self.lm_head.weight = self.tok_embed.weight
-            if cfg.use_mtp:
-                for proj in self.mtp.projs:
-                    proj.weight = self.tok_embed.weight
+            self.mtp = MultiTokenPredictionHead(cfg)
+            if self.mtp.projs:
+                self.mtp.projs[0].weight = self.lm_head.weight
+        else:
+            self.mtp = None
 
         self._init_weights()
 
-    # ── Weight initialisation ─────────────────────────────────────────────────
-
-    def _init_weights(self):
-        """Scaled normal init (LLaMA-style: std ∝ 1/√(2×num_layers))."""
-        std = 0.02 / math.sqrt(2 * self.cfg.num_layers)
-        for n, p in self.named_parameters():
-            if p.dim() >= 2 and "weight" in n:
-                nn.init.normal_(p, mean=0.0, std=std)
-            elif "bias" in n:
+    def _init_weights(self) -> None:
+        for name, p in self.named_parameters():
+            if p.dim() == 1:
                 nn.init.zeros_(p)
+            elif "embed" in name:
+                nn.init.normal_(p, mean=0.0, std=0.02)
+            elif p.dim() >= 2:
+                nn.init.xavier_uniform_(p)
 
-    # ── V1: sinusoidal noise-level embedding ──────────────────────────────────
+    def freeze_phase(self, phase: int) -> None:
+        for p in self.parameters():
+            p.requires_grad_(True)
+        if phase == 1:
+            for mod in [self.mtp, self.acgi, self.tdm]:
+                if mod is not None:
+                    for p in mod.parameters():
+                        p.requires_grad_(False)
+        elif phase == 2:
+            for p in self.acgi.parameters():
+                p.requires_grad_(False)
+        elif phase == 5:
+            for mod in [self.acgi, self.mtp]:
+                if mod is not None:
+                    for p in mod.parameters():
+                        p.requires_grad_(False)
+        elif phase in (7, 8):
+            for p in self.embed.parameters():
+                p.requires_grad_(False)
 
-    def _noise_embedding(
-        self,
-        noise_level: torch.Tensor,
-        device:      torch.device,
-    ) -> torch.Tensor:
-        """
-        Sinusoidal embedding for diffusion noise level t ∈ [0,1].
-        Matches v1 API: noise_level (B,) → (B, hidden_dim).
-        """
-        D    = self.cfg.hidden_dim
-        half = D // 2
-        freqs = torch.exp(
-            -torch.arange(half, device=device).float()
-            * (math.log(10000.0) / (half - 1))
+    def get_think_budget(self, U: torch.Tensor) -> int:
+        mean_u = U.mean().item()
+        thr    = self.cfg.uncertainty_thresh * 0.5
+        if mean_u < thr:
+            return 0
+        ratio  = (mean_u - thr) / max(1.0 - thr, 1e-8)
+        budget = int(
+            self.cfg.think_budget_min
+            + ratio * (self.cfg.think_budget_max - self.cfg.think_budget_min)
         )
-        args = noise_level.unsqueeze(1) * freqs.unsqueeze(0)
-        return torch.cat([args.sin(), args.cos()], dim=-1)   # (B, D)
+        return max(self.cfg.think_budget_min, min(budget, self.cfg.think_budget_max))
 
-    # ── Forward ───────────────────────────────────────────────────────────────
+    def _build_span_mask(
+        self,
+        ids:     torch.Tensor,
+        open_id: int,
+        close_id: int,
+        include_delimiters: bool = False,
+    ) -> torch.Tensor:
+        B, T   = ids.shape
+        mask   = torch.zeros(B, T, device=ids.device)
+        for b in range(B):
+            inside = False
+            for t in range(T):
+                tok = ids[b, t].item()
+                if tok == open_id:
+                    inside = True
+                    if include_delimiters:
+                        mask[b, t] = 1.0
+                elif tok == close_id:
+                    if include_delimiters:
+                        mask[b, t] = 1.0
+                    inside = False
+                elif inside:
+                    mask[b, t] = 1.0
+        return mask
+
+    def _noise_embedding(self, t: torch.Tensor) -> torch.Tensor:
+        half  = self.cfg.hidden_dim // 2
+        freqs = torch.exp(
+            -math.log(10000.0)
+            * torch.arange(half, device=t.device).float()
+            / half
+        )
+        args = t[:, None].float() * freqs[None]
+        return torch.cat([args.sin(), args.cos()], dim=-1)
 
     def forward(
         self,
         input_ids:   torch.Tensor,
-        noise_level: Optional[torch.Tensor] = None,
-    ) -> Dict[str, torch.Tensor]:
-        """
-        Args:
-            input_ids   : (B, T) — token ids; may contain MASK tokens for diffusion
-            noise_level : (B,)   — diffusion timestep t ∈ [0,1] (v1 compat, optional)
-        """
-        B, T = input_ids.shape
-        C    = self.cfg.chunk_size
+        noise_t:     Optional[torch.Tensor] = None,
+        sam_slots:   Optional[torch.Tensor] = None,
+        tool_labels: Optional[torch.Tensor] = None,
+    ) -> Dict:
+        B, T   = input_ids.shape
+        device = input_ids.device
 
-        # ── Region masks (XLA-safe — fully vectorized, zero .item() calls) ──────
-        # cumsum trick: running total of start tokens minus end tokens → 1 inside
-        # span, 0 outside.  No Python loops, no host–device syncs, no HBM frags.
-        think_open  = (input_ids == self.cfg.think_start_id).long()
-        think_close = (input_ids == self.cfg.think_end_id).long()
-        tool_open   = (input_ids == self.cfg.tool_call_start).long()
-        tool_close  = (input_ids == self.cfg.tool_result_end).long()
+        h = self.embed(input_ids)
 
-        # Shift close by 1 so the closing token itself is still inside the span
-        think_mask  = (think_open.cumsum(dim=1) - think_close.cumsum(dim=1)
-                       ).clamp(0, 1).bool()
-        tool_mask   = (tool_open.cumsum(dim=1) - tool_close.cumsum(dim=1)
-                       ).clamp(0, 1).bool()
+        if noise_t is not None:
+            h = h + self._noise_embedding(noise_t).unsqueeze(1)
 
-        # ── Embed ─────────────────────────────────────────────────────────────
-        x = self.tok_embed(input_ids)                                  # (B, T, D)
+        think_mask = self._build_span_mask(input_ids, self.cfg.think_start_id, self.cfg.think_end_id)
+        tool_mask  = self._build_span_mask(input_ids, self.cfg.tool_call_start, self.cfg.tool_call_end, include_delimiters=True)
 
-        # V1 noise conditioning (diffusion timestep injection)
-        if noise_level is not None:
-            x = x + 0.05 * noise_level.float().view(B, 1, 1) * torch.ones_like(x)
+        ect_h, U, prm_scores = self.ect(h, is_think=think_mask)
 
-        # ── Initial ECT pass — seed U before transformer blocks ───────────────
-        _ect_h, U, prm_init = self.ect(x, is_think=think_mask)
+        if sam_slots is not None:
+            sam_mem = sam_slots
+        elif self.sam is not None:
+            sam_mem = self.sam.get_slots(B, device)
+        else:
+            sam_mem = None
 
-        # ── SAM prefix ────────────────────────────────────────────────────────
-        sam_prefix = None
-        sam_aux    = x.new_zeros(1)
-        if self.cfg.use_sam:
-            sam_prefix, sam_aux = self.sam(x)
+        mem       = sam_mem
+        aux_total = h.new_zeros(1)
+        alpha_list: List[torch.Tensor] = []
+        h_chunks:   List[torch.Tensor] = []
 
-        # ── Chunked transformer blocks ─────────────────────────────────────────
-        all_hidden  = torch.zeros_like(x)
-        mem_tokens  = sam_prefix
-        total_aux   = sam_aux
-        alpha_list  = []                          # V1 compat: collect per-block alphas
-        n_chunks    = math.ceil(T / C)
+        chunk_size = self.cfg.chunk_size
+        n_chunks   = math.ceil(T / chunk_size)
 
         for ci in range(n_chunks):
-            s     = ci * C
-            e     = min(s + C, T)
-            chunk = x[:, s:e]
-            Uc    = U[:, s:e]
+            s   = ci * chunk_size
+            e   = min(s + chunk_size, T)
+            h_c = h[:, s:e, :]
+            U_c = U[:, s:e]
 
-            chunk_alphas = []
-            for bi, block in enumerate(self.blocks):
-                mt          = mem_tokens if bi == 0 else None
-                chunk, aux, alpha = block(chunk, U=Uc, mem=mt)
-                total_aux   = total_aux + aux
-                chunk_alphas.append(alpha)
+            for li, block in enumerate(self.blocks):
+                inj_mem = mem if li == 0 else None
+                h_c, aux, alpha = block(h_c, U=U_c, mem=inj_mem)
+                aux_total = aux_total + aux
+                if ci == 0:
+                    alpha_list.append(alpha)
 
-            all_hidden[:, s:e] = chunk
-            # Aggregate alpha per chunk as mean across blocks (for logging)
-            if chunk_alphas:
-                alpha_list.append(
-                    torch.stack(chunk_alphas, dim=0).mean(0)          # (B, chunk_T)
-                )
+            if self.tdm is not None:
+                tdm_mem, _ = self.tdm(h_c, U_c)
+                mem = torch.cat([sam_mem, tdm_mem], dim=1) if sam_mem is not None else tdm_mem
 
-            # TDM: compress confident chunk states → rolling memory
-            if ci < n_chunks - 1:
-                _, Uc_ref, _ = self.ect(chunk)
-                mem_tokens, tdm_loss = self.tdm(chunk, Uc_ref)
-                total_aux    = total_aux + tdm_loss
+            h_chunks.append(h_c)
 
-        # ── Final ECT pass (full sequence) ────────────────────────────────────
-        ect_h_final, U_final, prm_final = self.ect(all_hidden, is_think=think_mask)
+        h = torch.cat(h_chunks, dim=1)
 
-        # ── ACGI: per-token tool-call gate ────────────────────────────────────
-        acgi_out = self.acgi(all_hidden, U_final, ect_h_final)
+        if T >= self.cfg.dsa_threshold and self.dsa is not None:
+            h = self.dsa(h, U)
 
-        # ── Output heads ──────────────────────────────────────────────────────
-        h_norm      = self.final_norm(all_hidden)
+        _, U_final, prm_final = self.ect(h, is_think=think_mask)
+
+        acgi_out    = self.acgi(h, U_final, ect_h)
+        h_norm      = self.final_norm(h)
         ar_logits   = self.lm_head(h_norm)
         diff_logits = self.diff_head(h_norm)
-
-        # ── MTP heads (active from phase 3 onwards) ───────────────────────────
-        mtp_logits = None
-        if self.cfg.use_mtp:
-            mtp_logits = self.mtp(h_norm)
-
-        # V1 compat: flatten alpha_list to cover full sequence
-        full_alpha = torch.cat(alpha_list, dim=1) if alpha_list else None
+        mtp_logits  = self.mtp(h_norm) if self.mtp is not None else None
 
         return {
-            "ar_logits":      ar_logits,
-            "diff_logits":    diff_logits,
-            "uncertainty":    U_final,
-            "hidden":         all_hidden,
-            "aux_loss":       total_aux,
-            "prm_scores":     prm_final,
-            "think_mask":     think_mask,
-            "tool_mask":      tool_mask,
-            "acgi_gate":      acgi_out["gate_score"],
-            "acgi_gate_mask": acgi_out["gate_mask"],
-            "tool_logits":    acgi_out["tool_logits"],
-            "mtp_logits":     mtp_logits,
-            "alpha_list":     full_alpha,    # (B, T) mean gate — v1 compat
-            "ect_final":      ect_h_final,   # (B, E, D)        — v1 compat
+            "ar_logits":   ar_logits,
+            "diff_logits": diff_logits,
+            "uncertainty": U_final,
+            "aux_loss":    aux_total,
+            "mtp_logits":  mtp_logits,
+            "acgi_gate":   acgi_out["gate_score"],
+            "tool_logits": acgi_out.get("tool_logits"),
+            "prm_scores":  prm_final,
+            "think_mask":  think_mask,
+            "tool_mask":   tool_mask,
+            "hidden":      h_norm,
+            "alpha_list":  alpha_list,
         }
 
-    # ── V1: hybrid inference helper ───────────────────────────────────────────
+    def get_inference_output(self, input_ids: torch.Tensor, tau: float = 0.5) -> Dict:
+        out  = self.forward(input_ids)
+        U    = out["uncertainty"]
+        mask = (U > tau).float().unsqueeze(-1)
+        out["hybrid_logits"] = (1.0 - mask) * out["ar_logits"] + mask * out["diff_logits"]
+        return out
 
-    def get_inference_output(
-        self,
-        input_ids: torch.Tensor,
-        threshold: Optional[float] = None,
-    ) -> Dict[str, torch.Tensor]:
-        """
-        Inference helper (v1 API preserved).
-        Merges AR and diffusion logits per-token based on ECT uncertainty:
-            U ≤ threshold → AR logits (confident)
-            U >  threshold → diffusion logits (uncertain, gets refinement)
-
-        Args:
-            input_ids : (B, T)
-            threshold : override uncertainty_thresh from config (optional)
-        Returns:
-            dict with "logits" key (merged) plus all standard forward keys
-        """
-        if threshold is not None:
-            self.hard_gate.threshold = threshold
-
-        out         = self.forward(input_ids)
-        ar_logits   = out["ar_logits"]
-        diff_logits = out["diff_logits"]
-        uncertainty = out["uncertainty"]
-
-        flagged, _  = self.hard_gate.get_uncertain_positions(uncertainty, input_ids)
-        flagged_3d  = flagged.unsqueeze(-1).expand_as(ar_logits)
-
-        merged_logits = torch.where(flagged_3d, diff_logits, ar_logits)
-
-        return {
-            "logits":      merged_logits,
-            "uncertainty": uncertainty,
-            "flagged":     flagged,
-            **out,
+    def count_params_detailed(self) -> Dict[str, int]:
+        def _n(m):
+            return sum(p.numel() for p in m.parameters())
+        counts = {
+            "embed":     self.embed.weight.numel(),
+            "blocks":    _n(self.blocks),
+            "ect":       _n(self.ect),
+            "acgi":      _n(self.acgi),
+            "diff_head": _n(self.diff_head),
+            "mtp":       _n(self.mtp) if self.mtp else 0,
+            "tdm":       _n(self.tdm) if self.tdm else 0,
+            "sam":       _n(self.sam) if self.sam else 0,
+            "dsa":       _n(self.dsa) if self.dsa else 0,
+            "lm_head":   0,
         }
-
-    # ── Think-budget gating ───────────────────────────────────────────────────
-
-    def get_think_budget(self, U: torch.Tensor) -> int:
-        """
-        Decide how many think tokens to allocate based on mean ECT uncertainty.
-        High U → full budget (hard problem); low U → zero (no-think mode).
-        """
-        mean_U = U.mean().item()
-        if mean_U > self.cfg.ect_spawn_thresh:
-            return self.cfg.think_budget_max
-        elif mean_U > 0.4:
-            return self.cfg.think_budget_max // 2
-        elif mean_U > 0.2:
-            return self.cfg.think_budget_max // 4
-        return 0
-
-    # ── Phase-wise parameter freezing ────────────────────────────────────────
-
-    def freeze_phase(self, phase: int):
-        """
-        Freeze / unfreeze parameter groups for each training phase.
-        Called at the start of each phase in run_phase().
-        """
-        if phase == 1:
-            # AR warmup: freeze ECT, diffusion, agentic — backbone + lm_head only
-            for p in self.ect.parameters():       p.requires_grad_(False)
-            for p in self.diff_head.parameters(): p.requires_grad_(False)
-            for p in self.tdm.parameters():       p.requires_grad_(False)
-            for p in self.acgi.parameters():      p.requires_grad_(False)
-            if self.cfg.use_sam:
-                for p in self.sam.parameters():   p.requires_grad_(False)
-            if self.cfg.use_mtp:
-                for p in self.mtp.parameters():   p.requires_grad_(False)
-
-        elif phase == 2:
-            # Diffusion warmup: add diff_head; everything else still from phase 1
-            for p in self.diff_head.parameters(): p.requires_grad_(True)
-
-        elif phase in (3, 4, 5, 6):
-            # Joint / SFT / DPO / GRPO: everything except agentic modules
-            for p in self.parameters():            p.requires_grad_(True)
-            for p in self.acgi.parameters():       p.requires_grad_(False)
-            if self.cfg.use_sam:
-                for p in self.sam.parameters():    p.requires_grad_(False)
-
-        elif phase == 7:
-            # Agentic SFT: freeze backbone; unfreeze ACGI + SAM + lm_head + MTP
-            for p in self.parameters():            p.requires_grad_(False)
-            for p in self.acgi.parameters():       p.requires_grad_(True)
-            if self.cfg.use_sam:
-                for p in self.sam.parameters():    p.requires_grad_(True)
-            for p in self.lm_head.parameters():    p.requires_grad_(True)
-            if self.cfg.use_mtp:
-                for p in self.mtp.parameters():    p.requires_grad_(True)
-
-        elif phase == 8:
-            # Agentic RL: full unfreeze for end-to-end trajectory credit
-            for p in self.parameters():            p.requires_grad_(True)
-
-    # ── Parameter counts ─────────────────────────────────────────────────────
-
-    def count_params(self) -> Dict[str, int]:
-        """V1 API: per-component parameter counts."""
-        def n(m): return sum(p.numel() for p in m.parameters())
-
-        embedding_count = n(self.tok_embed)
-        blocks_count    = n(self.blocks)
-        ect_count       = n(self.ect)
-        tdm_count       = n(self.tdm)
-        acgi_count      = n(self.acgi)
-        sam_count       = n(self.sam) if self.cfg.use_sam else 0
-        mtp_count       = n(self.mtp) if self.cfg.use_mtp else 0
-        # lm_head is tied → 0 extra; diff_head is separate
-        lm_head_count   = 0 if self.cfg.weight_tying else n(self.lm_head)
-        diff_head_count = n(self.diff_head)
-        total           = n(self)
-
-        # Approximate active params: subtract inactive MoE expert params
-        try:
-            inactive_expert_params = sum(
-                sum(p.numel() for p in b.ffn.experts[b.ffn.top_k:].parameters())
-                for b in self.blocks if b.is_moe
-            )
-        except AttributeError:
-            inactive_expert_params = 0
-        approx_active = total - inactive_expert_params
-
-        return {
-            "embedding":     embedding_count,
-            "blocks":        blocks_count,
-            "ect":           ect_count,
-            "tdm":           tdm_count,
-            "acgi":          acgi_count,
-            "sam":           sam_count,
-            "mtp":           mtp_count,
-            "lm_head":       lm_head_count,
-            "diff_head":     diff_head_count,
-            "total":         total,
-            "approx_active": approx_active,
-        }
+        counts["total"] = sum(p.numel() for p in self.parameters())
+        return counts

@@ -1,11 +1,3 @@
-"""
-model/__init__.py — LeoSLM model package public API
-=====================================================
-Import the model like:
-    from model import LeoSLM, LeoConfig, CFG
-    from model import LEO_IDENTITY, LEO_SYSTEM_PROMPT
-"""
-
 from .config    import LeoConfig, CFG
 from .identity  import LEO_IDENTITY, LEO_SYSTEM_PROMPT
 from .norm      import RMSNorm
