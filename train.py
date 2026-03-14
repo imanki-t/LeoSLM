@@ -283,31 +283,42 @@ def run_phase(
     xm.master_print(f"  ctx={ctx:,} | τ={tau} | lr={lr_max} | epochs={epochs}")
     xm.master_print(f"{'='*65}")
 
+    # Unwrap FSDP so we can safely access .cfg and call .freeze_phase().
+    # FSDP forwards most attrs but cfg mutation and freeze logic are fragile on the wrapper.
+    raw_model = model.module if hasattr(model, "module") else model
+
     # Update dataset context length and model uncertainty threshold for this phase
     dataset.set_seq_len(ctx)
-    model.cfg.uncertainty_thresh = tau
-    model.freeze_phase(phase)
+    raw_model.cfg.uncertainty_thresh = tau
+    raw_model.freeze_phase(phase)
     loss_fn.set_lambda_mdm(pc["mdm"])
 
-    loader = DataLoader(dataset, batch_size=1, shuffle=True, num_workers=0, drop_last=True)
+    # Phase 5 needs batch_size=2 so we can split chosen/rejected pairs by uncertainty.
+    # All other phases use batch_size=1 (memory budget from config).
+    batch_size = 2 if phase == 5 else 1
+    loader = DataLoader(dataset, batch_size=batch_size, shuffle=True, num_workers=0, drop_last=True)
     if XLA_AVAILABLE:
         loader = pl.MpDeviceLoader(loader, device)
 
-    # Instantiate RL trainers for phases 6 and 8 (only created when needed)
+    # Instantiate phase-specific trainers (only created when needed)
+    dpo          = None
     grpo         = None
     agentic_grpo = None
-    if phase == 6:
+    if phase == 5:
+        from training import FactualityDPO
+        dpo = FactualityDPO(raw_model.cfg, beta=0.1)
+    elif phase == 6:
         grpo = GRPOTrainer(
-            cfg            = model.cfg,
+            cfg            = raw_model.cfg,
             model          = model,
             optimizer      = optimizer,
-            think_start_id = model.cfg.think_start_id,
-            think_end_id   = model.cfg.think_end_id,
-            idk_id         = model.cfg.idk_id,
+            think_start_id = raw_model.cfg.think_start_id,
+            think_end_id   = raw_model.cfg.think_end_id,
+            idk_id         = raw_model.cfg.idk_id,
         )
     elif phase == 8:
         agentic_grpo = AgenticGRPO(
-            cfg       = model.cfg,
+            cfg       = raw_model.cfg,
             model     = model,
             optimizer = optimizer,
         )
@@ -321,7 +332,10 @@ def run_phase(
     optimizer.zero_grad()
 
     for epoch in range(epochs):
-        ep_loss, nb = 0.0, 0
+        # ep_loss_sum stays on XLA — we only call .item() once per epoch at the end.
+        # This avoids per-step host syncs while keeping the epoch avg correct.
+        ep_loss_sum = torch.zeros(1, device=device)
+        nb          = 0
 
         for batch in loader:
             input_ids = batch["input_ids"].to(device)
@@ -331,7 +345,21 @@ def run_phase(
             set_lr(optimizer, lr)
 
             # ── Forward + loss ─────────────────────────────────────────────────
-            if phase == 6 and grpo is not None:
+            if phase == 5 and dpo is not None:
+                # DPO Phase: batch_size=2 — sort by uncertainty → chosen / rejected
+                out    = model(input_ids)
+                U_mean = out["uncertainty"].mean(dim=1)      # (2,)
+                lo, hi = (0, 1) if U_mean[0] <= U_mean[1] else (1, 0)
+                # Slice all (2, ...) tensors into chosen / rejected dicts
+                chosen_out   = {k: v[lo:lo+1] for k, v in out.items()
+                                if isinstance(v, torch.Tensor) and v.shape[0] == 2}
+                rejected_out = {k: v[hi:hi+1] for k, v in out.items()
+                                if isinstance(v, torch.Tensor) and v.shape[0] == 2}
+                loss, metrics = dpo(chosen_out, rejected_out,
+                                    input_ids[lo:lo+1], input_ids[hi:hi+1])
+                (loss / grad_accum).backward()
+
+            elif phase == 6 and grpo is not None:
                 metrics = grpo.grpo_step(batch, device)
                 loss    = metrics["total"]
                 (loss / grad_accum).backward()
@@ -342,9 +370,9 @@ def run_phase(
                 (loss / grad_accum).backward()
 
             else:
-                # Phases 1-5, 7: standard supervised training
+                # Phases 1-4, 7: standard supervised training
                 out           = model(input_ids)
-                loss, metrics = loss_fn(out, input_ids, model=model, phase=phase)
+                loss, metrics = loss_fn(out, input_ids, model=raw_model, phase=phase)
                 (loss / grad_accum).backward()
 
             # ── Gradient step ──────────────────────────────────────────────────
@@ -361,6 +389,13 @@ def run_phase(
             nb   += 1
             step += 1
 
+            # Accumulate epoch loss as a tensor every step — no .item(), no XLA sync.
+            _loss_t = metrics.get("total", loss)
+            if isinstance(_loss_t, torch.Tensor):
+                ep_loss_sum = ep_loss_sum + _loss_t.detach()
+            else:
+                ep_loss_sum = ep_loss_sum + torch.tensor(_loss_t, device=device)
+
             _do_log  = (step % 10        == 0)
             _do_ckpt = (step % save_every == 0)
 
@@ -370,7 +405,6 @@ def run_phase(
                 loss_val = loss.item() if isinstance(loss, torch.Tensor) else loss
                 m_cpu    = {k: (v.item() if isinstance(v, torch.Tensor) else v)
                             for k, v in metrics.items()}
-                ep_loss += m_cpu.get("total", loss_val)
 
             if _do_log:
                 extra = ""
@@ -397,7 +431,8 @@ def run_phase(
                 xm.master_print("  🔥 Smoke test complete (50 steps)")
                 return step
 
-        avg = ep_loss / max(nb, 1)
+        # Single XLA sync per epoch — correct average over all steps
+        avg = ep_loss_sum.cpu().item() / max(nb, 1)
         xm.master_print(f"  ✅ Epoch {epoch+1}/{epochs} | avg_loss={avg:.3f}")
         if avg < best:
             best = avg
