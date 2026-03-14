@@ -1,0 +1,19 @@
+import subprocess, sys
+
+subprocess.run([sys.executable, "-m", "pip", "install",
+    "transformers>=4.40.0", "datasets>=2.18.0",
+    "tokenizers>=0.19.0",   "huggingface_hub>=0.22.0",
+    "scikit-learn>=1.3.0",  "kaggle>=1.6.0",   # ← this was missing
+    "-q"
+], check=True)
+print("✅ Dependencies installed")
+
+try:
+    import torch_xla.core.xla_model as xm
+    devices = xm.get_xla_supported_devices()
+    print(f"✅ TPU ready — {xm.xla_device()} | {len(devices)}/8 chips")
+except ImportError:
+    print("❌ torch_xla not found — set Accelerator to TPU v5e-8 in Settings")
+
+import torch
+print(f"✅ PyTorch {torch.__version__}")
