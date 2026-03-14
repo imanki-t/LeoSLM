@@ -48,11 +48,10 @@ ONE NOTEBOOK (TPU v5e-8 — does everything):
 
 ## THE NOTEBOOK — TPU v5e-8
 
-### Create notebook:
+### Create notebook (one time ever):
 1. **https://kaggle.com/code** → New Notebook
 2. Settings → **Accelerator: TPU v5e-8** → **Internet: On**
-3. *(Session 2+ only)* **Add Data** → search `leo-checkpoints` → Add
-   *(Session 1: skip this — no checkpoints exist yet)*
+3. Paste cells 1–5, fill in your 4 tokens in Cell 1, save
 
 ---
 
@@ -132,51 +131,81 @@ print(f"✅ PyTorch {torch.__version__}")
 
 ---
 
-### Cell 3 — Data Prep + Restore  *(~5 hrs first time, ~30s after)*
+### Cell 3 — Auto-Restore + Data Prep  *(fully automatic every session)*
 
-> **First session:** runs `prep_data.py` — streams 2.1B tokens from 6 HuggingFace
-> datasets, writes them **in chunks directly to a binary file on disk**, then uses
-> `memmap` to split into `train.npy` / `val.npy`. **Zero RAM spike** — the old
-> `np.array(all_tokens)` call that caused the OOM restart is gone.
-> After prep, the data is auto-pushed to a `leo-training-data` Kaggle Dataset.
+> **Every session:** automatically downloads checkpoints and training data
+> from your Kaggle datasets using the API credentials you set in Cell 1.
+> No "Add Data" clicking needed — ever.
 >
-> **Session 2+:** copies from `leo-training-data` in seconds and skips prep entirely.
+> **Session 1:** checkpoints dataset doesn't exist yet → skips download → runs
+> full data prep (~5 hrs) → auto-creates both datasets for future sessions.
+>
+> **Session 2+:** downloads checkpoints (~30s) + skips data prep entirely.
 
 ```python
-import shutil, os, numpy as np, subprocess, json
+import shutil, os, numpy as np, subprocess, json, zipfile
 from pathlib import Path
 
 os.chdir("/kaggle/working/LeoSLM")
 os.makedirs("data",          exist_ok=True)
 os.makedirs("leo_tokenizer", exist_ok=True)
+os.makedirs("checkpoints",   exist_ok=True)
 
+KAGGLE_USERNAME = os.environ.get("KAGGLE_USERNAME", "")
 TRAIN = Path("./data/train.npy")
 VAL   = Path("./data/val.npy")
 
-# ── Try to restore saved data first (session 2+) ──────────────────────────
-DATA_SRC = Path("/kaggle/input/leo-training-data")
-if DATA_SRC.exists() and not TRAIN.exists():
-    print("📦 Restoring data from leo-training-data dataset...")
-    for f in ["train.npy", "val.npy"]:
-        src = DATA_SRC / "data" / f
-        if src.exists():
-            shutil.copy(src, f"./data/{f}")
-            print(f"   {f}  ({src.stat().st_size/1e9:.2f} GB)")
-    tok_src = DATA_SRC / "leo_tokenizer"
-    if tok_src.exists():
-        shutil.copytree(str(tok_src), "./leo_tokenizer", dirs_exist_ok=True)
-        print("   leo_tokenizer restored")
+def kaggle_dataset_exists(dataset_slug):
+    """Returns True if the dataset exists on Kaggle (i.e. was created in a prior session)."""
+    r = subprocess.run(
+        ["kaggle", "datasets", "status", dataset_slug],
+        capture_output=True, text=True
+    )
+    return r.returncode == 0
 
-# ── Restore checkpoints (session 2+) ──────────────────────────────────────
-CKPT_SRC = Path("/kaggle/input/leo-checkpoints")
-if CKPT_SRC.exists():
-    shutil.copytree(str(CKPT_SRC), "./checkpoints", dirs_exist_ok=True)
-    ckpts = list(Path("./checkpoints").glob("*.pt"))
-    print(f"✅ Checkpoints restored ({len(ckpts)} files) — will auto-resume")
+def download_and_unzip(dataset_slug, dest_dir):
+    """Download a Kaggle dataset zip and unzip it into dest_dir."""
+    os.makedirs(dest_dir, exist_ok=True)
+    r = subprocess.run(
+        ["kaggle", "datasets", "download", dataset_slug,
+         "--path", dest_dir, "--unzip"],
+        capture_output=True, text=True
+    )
+    return r.returncode == 0
+
+# ── Auto-download checkpoints (session 2+) ────────────────────────────────
+CKPT_SLUG = f"{KAGGLE_USERNAME}/leo-checkpoints"
+if kaggle_dataset_exists(CKPT_SLUG):
+    print("📦 Downloading checkpoints from Kaggle...")
+    ok = download_and_unzip(CKPT_SLUG, "./checkpoints")
+    if ok:
+        ckpts = list(Path("./checkpoints").glob("*.pt"))
+        print(f"✅ Checkpoints restored ({len(ckpts)} files) — will auto-resume")
+    else:
+        print("⚠️  Checkpoint download failed — starting fresh this session")
 else:
-    print("ℹ️  No prior checkpoints — starting fresh (session 1 only)")
+    print("ℹ️  No checkpoints dataset yet — session 1, starting fresh")
 
-# ── Run prep if data still missing ────────────────────────────────────────
+# ── Auto-download training data (session 2+) ──────────────────────────────
+DATA_SLUG = f"{KAGGLE_USERNAME}/leo-training-data"
+if not TRAIN.exists() and kaggle_dataset_exists(DATA_SLUG):
+    print("📦 Downloading training data from Kaggle (~8 GB, ~2 min)...")
+    tmp = "/kaggle/working/leo_data_dl"
+    ok  = download_and_unzip(DATA_SLUG, tmp)
+    if ok:
+        for f in ["train.npy", "val.npy"]:
+            src = Path(f"{tmp}/data/{f}")
+            if src.exists():
+                shutil.copy(src, f"./data/{f}")
+                print(f"   {f}  ({src.stat().st_size/1e9:.2f} GB)")
+        tok_src = Path(f"{tmp}/leo_tokenizer")
+        if tok_src.exists():
+            shutil.copytree(str(tok_src), "./leo_tokenizer", dirs_exist_ok=True)
+            print("   leo_tokenizer restored")
+    else:
+        print("⚠️  Data download failed — will re-run prep")
+
+# ── Run prep if data still missing (session 1 only) ───────────────────────
 if TRAIN.exists() and VAL.exists():
     train = np.load(str(TRAIN), mmap_mode="r")
     val   = np.load(str(VAL),   mmap_mode="r")
@@ -198,39 +227,34 @@ else:
         print(f"   Train: {len(train):,} tokens ({len(train)*4/1e9:.2f} GB)")
         print(f"   Val:   {len(val):,} tokens   ({len(val)*4/1e6:.0f} MB)")
 
-        print("\n📦 Saving data to Kaggle Dataset for future sessions...")
+        # ── Push training data to Kaggle so future sessions auto-download it ──
+        print("\n📦 Pushing training data to Kaggle Dataset...")
         SAVE_DIR = "/kaggle/working/leo_data_save"
         os.makedirs(f"{SAVE_DIR}/data",          exist_ok=True)
         os.makedirs(f"{SAVE_DIR}/leo_tokenizer", exist_ok=True)
-
         for f in ["train.npy", "val.npy"]:
             src = Path(f"./data/{f}")
             if src.exists():
                 shutil.copy(src, f"{SAVE_DIR}/data/{f}")
-
         if Path("./leo_tokenizer").exists():
-            shutil.copytree("./leo_tokenizer", f"{SAVE_DIR}/leo_tokenizer", dirs_exist_ok=True)
-
-        kg_user = os.environ.get("KAGGLE_USERNAME", "you")
+            shutil.copytree("./leo_tokenizer", f"{SAVE_DIR}/leo_tokenizer",
+                            dirs_exist_ok=True)
         Path(f"{SAVE_DIR}/dataset-metadata.json").write_text(json.dumps({
             "title": "leo-training-data",
-            "id": f"{kg_user}/leo-training-data",
+            "id": DATA_SLUG,
             "licenses": [{"name": "CC0-1.0"}]
         }))
-
         r = subprocess.run(
             ["kaggle", "datasets", "create", "-p", SAVE_DIR, "--dir-mode", "zip"],
             capture_output=True, text=True
         )
-        if r.returncode == 0:
-            print(f"✅ leo-training-data created — add via Add Data next session")
-        else:
+        if r.returncode != 0:
             subprocess.run(
                 ["kaggle", "datasets", "version", "-p", SAVE_DIR,
                  "-m", "data prep complete", "--dir-mode", "zip"],
                 capture_output=True, text=True
             )
-            print("✅ leo-training-data updated")
+        print(f"✅ leo-training-data pushed — future sessions auto-download it")
     else:
         print("❌ prep_data.py failed — scroll up for error")
 ```
@@ -361,18 +385,15 @@ print("\n🎉 All done! Final checkpoints pushed to Kaggle Dataset.")
 
 ---
 
-### Session 2, 3, 4... — Exactly the same steps
+### Session 2, 3, 4... — Identical to Session 1
 
-1. New notebook → Settings → **TPU v5e-8** → **Internet: On**
-2. **Add Data** → search `leo-checkpoints` → Add
-   *(also add `leo-training-data` if it's not already in your datasets)*
-3. Run **Cell 1** (same 4 tokens, copy from your notes)
-4. Run **Cell 2** (install deps — ~60s)
-5. Run **Cell 3** (data restored in seconds, checkpoints restored, prep skipped)
-6. Run **Cell 4** (auto-skipped — checkpoint exists)
-7. Run **Cell 5** (detects `latest.pt`, passes `--resume`, trains, pushes)
+1. Open the **same notebook** (it's still there, nothing changed)
+2. Click **Run All**
+3. Walk away
 
-**No manual downloads. No manual uploads. No Output tab digging.**
+That's it. Cell 3 automatically downloads your latest checkpoints and training
+data from Kaggle using your API credentials. No "Add Data" clicking.
+No Output tab. No manual uploads. Nothing.
 
 ---
 
@@ -387,9 +408,9 @@ print("\n🎉 All done! Final checkpoints pushed to Kaggle Dataset.")
 | Training Phase 5–6 | TPU v5e-8 (all 8 chips) | ~9 hrs | ❌ unattended |
 | Training Phase 7–8 | TPU v5e-8 (all 8 chips) | ~9 hrs | ❌ unattended |
 
-**Total TPU v5e-8 hours:** ~35–40 hrs across ~5 sessions
-*(~30 free per week — done in ~2 weeks of free quota)*
+**Total TPU v5e-8 hours:** ~35–40 hrs across ~5 sessions (~30 free/week → ~2 weeks)
 **GPU T4 hours used:** 0
+**Your total effort:** fill in 4 tokens once → click Run All at the start of each session
 
 ---
 
@@ -400,7 +421,7 @@ print("\n🎉 All done! Final checkpoints pushed to Kaggle Dataset.")
 | `git clone failed` | Internet must be **ON** in Settings |
 | `Repository not found` | Repo is private — paste GitHub token in Cell 1 |
 | `No module named 'torch_xla'` | Accelerator must be **TPU v5e-8**, not GPU or None |
-| `leo-training-data` not found | Cell 3 auto-creates it on first run — add via Add Data next session |
+| `leo-training-data` download fails | Check Internet is ON in Settings. Cell 3 will fall back to re-running prep |
 | `No space left on device` | `rm ./checkpoints/phase*_step*.pt` (keep `latest.pt` only) |
 | `the-stack-smol` auth error | Accept licence at huggingface.co/datasets/bigcode/the-stack-smol |
 | Checkpoints lost after session | Output tab → `leo_checkpoint_save` always has them |
