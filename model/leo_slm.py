@@ -200,20 +200,19 @@ class LeoSLM(nn.Module):
         B, T = input_ids.shape
         C    = self.cfg.chunk_size
 
-        # ── Region masks ──────────────────────────────────────────────────────
-        # Scan once for <think> and tool-call spans (XLA: no dynamic shapes)
-        think_mask = torch.zeros_like(input_ids, dtype=torch.bool)
-        tool_mask  = torch.zeros_like(input_ids, dtype=torch.bool)
-        for b in range(B):
-            in_think = in_tool = False
-            for t in range(T):
-                tok = input_ids[b, t].item()
-                if tok == self.cfg.think_start_id:  in_think = True
-                if in_think:                         think_mask[b, t] = True
-                if tok == self.cfg.think_end_id:    in_think = False
-                if tok == self.cfg.tool_call_start: in_tool = True
-                if in_tool:                          tool_mask[b, t] = True
-                if tok == self.cfg.tool_result_end: in_tool = False
+        # ── Region masks (XLA-safe — fully vectorized, zero .item() calls) ──────
+        # cumsum trick: running total of start tokens minus end tokens → 1 inside
+        # span, 0 outside.  No Python loops, no host–device syncs, no HBM frags.
+        think_open  = (input_ids == self.cfg.think_start_id).long()
+        think_close = (input_ids == self.cfg.think_end_id).long()
+        tool_open   = (input_ids == self.cfg.tool_call_start).long()
+        tool_close  = (input_ids == self.cfg.tool_result_end).long()
+
+        # Shift close by 1 so the closing token itself is still inside the span
+        think_mask  = (think_open.cumsum(dim=1) - think_close.cumsum(dim=1)
+                       ).clamp(0, 1).bool()
+        tool_mask   = (tool_open.cumsum(dim=1) - tool_close.cumsum(dim=1)
+                       ).clamp(0, 1).bool()
 
         # ── Embed ─────────────────────────────────────────────────────────────
         x = self.tok_embed(input_ids)                                  # (B, T, D)
