@@ -1,10 +1,10 @@
 import os
 os.environ["XLA_TENSOR_ALLOCATOR_MAXSIZE"] = "1000000000"
 os.environ["PJRT_DEVICE"]                  = "TPU"
-os.environ.pop("XLA_FLAGS",    None)
-os.environ.pop("XLA_USE_BF16", None)
 os.environ["TF_CPP_MIN_LOG_LEVEL"]         = "3"
 os.environ["JAX_PLATFORMS"]                = "tpu"
+os.environ.pop("XLA_FLAGS",    None)
+os.environ.pop("XLA_USE_BF16", None)
 
 import sys
 import math
@@ -12,6 +12,7 @@ import time
 import argparse
 from pathlib import Path
 from typing import Dict
+from functools import partial
 
 import torch
 import torch.nn as nn
@@ -19,15 +20,16 @@ from torch.utils.data import DataLoader
 
 try:
     import torch_xla
-    import torch_xla.core.xla_model                  as xm
-    import torch_xla.distributed.xla_multiprocessing as xmp
-    import torch_xla.distributed.parallel_loader     as pl
+    import torch_xla.core.xla_model           as xm
+    import torch_xla.distributed.parallel_loader as pl
     from torch_xla.distributed.fsdp import XlaFullyShardedDataParallel as FSDP
+    from torch_xla.distributed.fsdp import checkpoint_module
     XLA_AVAILABLE = True
     xm.master_print("torch_xla: TPU mode")
 except ImportError:
     XLA_AVAILABLE = False
     FSDP = None
+    checkpoint_module = lambda m: m
 
     class _XMFallback:
         def xla_device(self):             return torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -36,6 +38,7 @@ except ImportError:
         def get_ordinal(self):            return 0
         def xrt_world_size(self):         return 1
         def master_print(self, *a, **k):  print(*a, **k)
+        def rendezvous(self, t):          pass
 
     xm = _XMFallback()
     print("torch_xla not found — CPU/GPU fallback")
@@ -44,10 +47,12 @@ try:
     from transformers.optimization import Adafactor
 except ImportError:
     import subprocess
-    subprocess.run([sys.executable, "-m", "pip", "install", "--user", "transformers", "-q"], check=True)
+    subprocess.run([sys.executable, "-m", "pip", "install", "--user", "transformers", "-q"],
+                   check=False)
     from transformers.optimization import Adafactor
 
 from model    import LeoSLM, LeoConfig, CFG, LEO_IDENTITY
+from model    import LeoBlock
 from training import LeoLoss, GRPOTrainer, AgenticGRPO
 from data     import LeoDataset
 
@@ -58,16 +63,13 @@ def load_leotokenizer(path: str = "./leo_tokenizer"):
         tok = PreTrainedTokenizerFast.from_pretrained(path)
         xm.master_print(f"LeoTokenizer loaded (vocab={tok.vocab_size:,})")
         return tok
-
-    xm.master_print("LeoTokenizer not found — run prep_data.py --tok-only first")
-    xm.master_print("Falling back to GPT-2 tokenizer as placeholder...")
+    xm.master_print("LeoTokenizer not found — falling back to GPT-2")
     from transformers import AutoTokenizer
     tok = AutoTokenizer.from_pretrained("gpt2")
     tok.add_special_tokens({
         "pad_token": "[PAD]",
         "additional_special_tokens": [
             "[MASK]", "[IDK]", "<think>", "</think>",
-            "[BUDGET]",
             "<|tool_call|>", "<|/tool_call|>",
             "<|tool_result|>", "<|/tool_result|>",
             "<|system|>",
@@ -76,13 +78,7 @@ def load_leotokenizer(path: str = "./leo_tokenizer"):
     return tok
 
 
-def cosine_lr(
-    step:    int,
-    warmup:  int,
-    total:   int,
-    lr_max:  float,
-    lr_min:  float,
-) -> float:
+def cosine_lr(step, warmup, total, lr_max, lr_min):
     if total <= 0:
         return lr_max
     if step < warmup:
@@ -91,16 +87,17 @@ def cosine_lr(
     return lr_min + 0.5 * (lr_max - lr_min) * (1 + math.cos(math.pi * f))
 
 
-def set_lr(optimizer, lr: float):
+def set_lr(optimizer, lr):
     for pg in optimizer.param_groups:
         pg["lr"] = lr
 
 
-def save_ckpt(model, optimizer, step: int, phase: int, loss: float, path: str):
+def save_ckpt(model, optimizer, step, phase, loss, path):
     os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
     tmp = path + ".tmp"
+    raw = model.module if hasattr(model, "module") else model
     torch.save({
-        "model":     model.state_dict(),
+        "model":     raw.state_dict(),
         "optimizer": optimizer.state_dict(),
         "step":      step,
         "phase":     phase,
@@ -110,14 +107,15 @@ def save_ckpt(model, optimizer, step: int, phase: int, loss: float, path: str):
     xm.master_print(f"   saved {path} (step={step}, phase={phase}, loss={loss:.3f})")
 
 
-def load_ckpt(model, optimizer, path: str, device) -> tuple:
+def load_ckpt(model, optimizer, path, device):
     if not os.path.exists(path):
         return 0, 1
-    c = torch.load(path, map_location=device)
-    model.load_state_dict(c["model"])
+    c   = torch.load(path, map_location=device)
+    raw = model.module if hasattr(model, "module") else model
+    raw.load_state_dict(c["model"])
     if optimizer and "optimizer" in c:
         optimizer.load_state_dict(c["optimizer"])
-    xm.master_print(f"   Resumed {path} (step={c.get('step', 0)}, phase={c.get('phase', 1)})")
+    xm.master_print(f"   Resumed {path} (step={c.get('step',0)}, phase={c.get('phase',1)})")
     return c.get("step", 0), c.get("phase", 1)
 
 
@@ -141,25 +139,38 @@ PHASE_CFG: Dict[int, Dict] = {
 }
 
 
+def wrap_fsdp(model: nn.Module) -> nn.Module:
+    if not XLA_AVAILABLE or FSDP is None:
+        return model
+
+    for block in model.blocks:
+        block.__class__ = checkpoint_module(block.__class__)
+
+    auto_wrap_policy = partial(
+        torch_xla.distributed.fsdp.wrap.transformer_auto_wrap_policy,
+        transformer_layer_cls={LeoBlock},
+    )
+    wrapped = FSDP(
+        model,
+        auto_wrap_policy      = auto_wrap_policy,
+        reshard_after_forward = True,
+        flatten_parameters    = True,
+    )
+    xm.rendezvous("fsdp_init")
+    return wrapped
+
+
 def run_phase(
-    phase:      int,
-    model:      nn.Module,
-    optimizer,
-    dataset:    LeoDataset,
-    loss_fn:    LeoLoss,
-    device,
-    grad_accum: int,
-    save_every: int,
-    ckpt_dir:   str,
-    start_step: int  = 0,
-    smoke:      bool = False,
-) -> int:
-    pc      = PHASE_CFG[phase]
-    epochs  = 1 if smoke else pc["epochs"]
-    ctx     = pc["ctx"]
-    tau     = pc["tau"]
-    lr_max  = pc["lr"]
-    lr_min  = lr_max * 0.1
+    phase, model, optimizer, dataset, loss_fn,
+    device, grad_accum, save_every, ckpt_dir,
+    start_step=0, smoke=False,
+):
+    pc     = PHASE_CFG[phase]
+    epochs = 1 if smoke else pc["epochs"]
+    ctx    = pc["ctx"]
+    tau    = pc["tau"]
+    lr_max = pc["lr"]
+    lr_min = lr_max * 0.1
 
     xm.master_print(f"\n{'='*65}")
     xm.master_print(f"  PHASE {phase} — {pc['desc']}")
@@ -167,21 +178,25 @@ def run_phase(
     xm.master_print(f"{'='*65}")
 
     raw_model = model.module if hasattr(model, "module") else model
-
     dataset.set_seq_len(ctx)
     raw_model.cfg.uncertainty_thresh = tau
     raw_model.freeze_phase(phase)
     loss_fn.set_lambda_mdm(pc["mdm"])
 
     batch_size = 2 if phase == 5 else 1
-    loader = DataLoader(dataset, batch_size=batch_size, shuffle=True, num_workers=0, drop_last=True)
+    loader = DataLoader(
+        dataset,
+        batch_size  = batch_size,
+        shuffle     = True,
+        num_workers = 4,
+        prefetch_factor = 2,
+        drop_last   = True,
+        pin_memory  = False,
+    )
     if XLA_AVAILABLE:
-        loader = pl.MpDeviceLoader(loader, device)
+        loader = pl.ParallelLoader(loader, [device]).per_device_loader(device)
 
-    dpo          = None
-    grpo         = None
-    agentic_grpo = None
-
+    dpo = grpo = agentic_grpo = None
     if phase == 5:
         from training import FactualityDPO
         dpo = FactualityDPO(raw_model.cfg, beta=0.1)
@@ -196,9 +211,7 @@ def run_phase(
         )
     elif phase == 8:
         agentic_grpo = AgenticGRPO(
-            cfg       = raw_model.cfg,
-            model     = model,
-            optimizer = optimizer,
+            cfg=raw_model.cfg, model=model, optimizer=optimizer,
         )
 
     total_steps = len(dataset) * epochs
@@ -247,22 +260,23 @@ def run_phase(
                 (loss / grad_accum).backward()
 
             if (step + 1) % grad_accum == 0:
-                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
                 if XLA_AVAILABLE:
-                    xm.optimizer_step(optimizer)
+                    xm.optimizer_step(optimizer, barrier=True)
                     xm.mark_step()
                 else:
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
                     optimizer.step()
                 optimizer.zero_grad()
 
             nb   += 1
             step += 1
 
-            _loss_t = metrics.get("total", loss)
-            if isinstance(_loss_t, torch.Tensor):
-                ep_loss_sum = ep_loss_sum + _loss_t.detach()
+            if isinstance(loss, torch.Tensor):
+                ep_loss_sum = ep_loss_sum + loss.detach()
+                if nb % grad_accum == 0:
+                    xm.mark_step()
             else:
-                ep_loss_sum = ep_loss_sum + torch.tensor(_loss_t, device=device)
+                ep_loss_sum = ep_loss_sum + torch.tensor(loss, device=device)
 
             _do_log  = (step % 10        == 0)
             _do_ckpt = (step % save_every == 0)
@@ -332,24 +346,24 @@ def main(rank=None):
     xm.master_print(f"{'='*65}\n")
 
     cfg   = LeoConfig()
-    model = LeoSLM(cfg).to(device)
+    model = LeoSLM(cfg)
+
+    if XLA_AVAILABLE:
+        model = model.to(torch.bfloat16)
 
     pc = model.count_params_detailed()
     xm.master_print(
         f"   Params   : {pc['total']/1e9:.2f}B total "
         f"| ~{pc.get('active_approx', pc['total'])/1e9:.2f}B active (MoE)"
     )
-    xm.master_print(
-        f"   MTP(N={cfg.mtp_n}) | DSA(>{cfg.dsa_threshold//1024}k) "
-        f"| ACGI(tau={cfg.acgi_threshold}) | SAM(M={cfg.sam_memory_size})"
-    )
+
+    model = model.to(device)
+    model = wrap_fsdp(model)
 
     if XLA_AVAILABLE and FSDP is not None:
-        model = FSDP(model, reshard_after_forward=True)
-        model = model.to(torch.bfloat16)
-        xm.master_print("   FSDP     : OK (8-chip full sharding, bf16)")
-    elif XLA_AVAILABLE:
-        model = model.to(torch.bfloat16)
+        xm.master_print("   FSDP     : OK (block-level sharding across 8 chips, bf16)")
+    else:
+        xm.master_print("   FSDP     : disabled (no torch_xla)")
 
     optimizer = Adafactor(
         model.parameters(),
@@ -407,9 +421,7 @@ def main(rank=None):
 
     xm.master_print(f"\n{'='*65}")
     xm.master_print("  Leo Aether training complete!")
-    xm.master_print(f"  Built by      : Unmuted")
-    xm.master_print(f"  Architecture  : MLA + MoE + ECT + TDM + ACGI + SAM + MTP + DSA")
-    xm.master_print(f"  Next step     : python3 generate.py")
+    xm.master_print(f"  Next step : python3 generate.py")
     xm.master_print(f"{'='*65}\n")
 
 
