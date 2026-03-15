@@ -99,7 +99,7 @@ PHASE_CFG: Dict[int, Dict] = {
 }
 
 
-def wrap_fsdp(model):
+def wrap_fsdp(model, device=None):
     if not XLA_AVAILABLE or FSDP is None:
         return model
     for i, block in enumerate(model.blocks):
@@ -287,9 +287,10 @@ def main(rank=None):
     pc = model.count_params_detailed()
     xm.master_print(f"   Params   : {pc['total']/1e9:.2f}B total")
 
-    model = model.to(device)
-
     model = wrap_fsdp(model)
+
+    if not (XLA_AVAILABLE and FSDP is not None):
+        model = model.to(device)
 
     optimizer = Adafactor(
         model.parameters(),
