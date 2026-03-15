@@ -122,6 +122,13 @@ def wrap_fsdp(model):
         reshard_after_forward = True,
         flatten_parameters    = False,
     )
+
+    for p in wrapped.parameters():
+        if p.requires_grad:
+            def _make_hook(param):
+                return lambda g: torch.zeros_like(param.data) if g is None else g
+            p.register_hook(_make_hook(p))
+
     xm.rendezvous("fsdp_init")
     xm.master_print("   FSDP: OK (nested per-block, gradient checkpointing, 8-chip ZeRO-3)")
     return wrapped
@@ -143,7 +150,8 @@ def run_phase(phase, model, optimizer, dataset, loss_fn,
     raw_model = model.module if hasattr(model, "module") else model
     dataset.set_seq_len(pc["ctx"])
     raw_model.cfg.uncertainty_thresh = pc["tau"]
-    raw_model.freeze_phase(phase)
+    if not (XLA_AVAILABLE and FSDP is not None):
+        raw_model.freeze_phase(phase)
     loss_fn.set_lambda_mdm(pc["mdm"])
 
     batch_size = 2 if phase == 5 else 1
