@@ -92,7 +92,7 @@ class LeoGenerator:
         if device:
             self.device = torch.device(device)
         elif XLA_AVAILABLE:
-            self.device = xm.xla_device()
+            self.device = torch_xla.device()
         elif torch.cuda.is_available():
             self.device = torch.device("cuda")
         else:

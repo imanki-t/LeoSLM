@@ -1,8 +1,10 @@
 import os
-os.environ["XLA_USE_BF16"]                  = "1"
-os.environ["XLA_TENSOR_ALLOCATOR_MAXSIZE"]  = "1000000000"
-os.environ["PJRT_DEVICE"]                   = "TPU"
-os.environ.pop("XLA_FLAGS", None)
+os.environ["XLA_TENSOR_ALLOCATOR_MAXSIZE"] = "1000000000"
+os.environ["PJRT_DEVICE"]                  = "TPU"
+os.environ.pop("XLA_FLAGS",    None)
+os.environ.pop("XLA_USE_BF16", None)
+os.environ["TF_CPP_MIN_LOG_LEVEL"]         = "3"
+os.environ["JAX_PLATFORMS"]                = "tpu"
 
 import sys
 import math
@@ -315,7 +317,7 @@ def main(rank=None):
     parser.add_argument("--save_every", type=int,   default=100)
     args = parser.parse_args()
 
-    device = xm.xla_device() if XLA_AVAILABLE else (
+    device = torch_xla.device() if XLA_AVAILABLE else (
         torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
     )
 
