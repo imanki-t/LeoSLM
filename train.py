@@ -111,23 +111,12 @@ def wrap_fsdp(model):
         transformer_layer_cls={LeoBlock},
     )
 
-    auto_wrapper_callable = lambda m, *args, **kwargs: FSDP(
-        checkpoint_module(m), *args, **kwargs
-    )
-
     wrapped = FSDP(
         model,
         auto_wrap_policy      = auto_wrap_policy,
-        auto_wrapper_callable = auto_wrapper_callable,
         reshard_after_forward = True,
         flatten_parameters    = False,
     )
-
-    for p in wrapped.parameters():
-        if p.requires_grad:
-            def _make_hook(param):
-                return lambda g: torch.zeros_like(param.data) if g is None else g
-            p.register_hook(_make_hook(p))
 
     xm.rendezvous("fsdp_init")
     xm.master_print("   FSDP: OK (nested per-block, gradient checkpointing, 8-chip ZeRO-3)")
