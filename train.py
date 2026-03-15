@@ -7,7 +7,7 @@ os.environ["JAX_PLATFORMS"]               = "tpu"
 os.environ.pop("XLA_FLAGS",    None)
 os.environ.pop("XLA_USE_BF16", None)
 
-import sys, math, time, argparse
+import sys, math, time, argparse, functools
 from pathlib import Path
 from typing import Dict
 
@@ -21,12 +21,14 @@ try:
     import torch_xla.distributed.parallel_loader as pl
     from torch_xla.distributed.fsdp import XlaFullyShardedDataParallel as FSDP
     from torch_xla.distributed.fsdp import checkpoint_module
+    from torch_xla.distributed.fsdp.wrap import transformer_auto_wrap_policy
     XLA_AVAILABLE = True
     xm.master_print("torch_xla: TPU mode")
 except ImportError:
     XLA_AVAILABLE    = False
     FSDP             = None
-    checkpoint_module = lambda m: m
+    checkpoint_module         = lambda m: m
+    transformer_auto_wrap_policy = None
     class _XM:
         def xla_device(self):             return torch.device("cuda" if torch.cuda.is_available() else "cpu")
         def optimizer_step(self, o, **k): o.step()
@@ -47,6 +49,7 @@ except ImportError:
     from transformers.optimization import Adafactor
 
 from model    import LeoSLM, LeoConfig, CFG, LEO_IDENTITY
+from model    import LeoBlock
 from training import LeoLoss, GRPOTrainer, AgenticGRPO
 from data     import LeoDataset
 
@@ -99,18 +102,28 @@ PHASE_CFG: Dict[int, Dict] = {
 }
 
 
-def wrap_fsdp(model, device=None):
-    if not XLA_AVAILABLE or FSDP is None:
+def wrap_fsdp(model):
+    if not XLA_AVAILABLE or FSDP is None or transformer_auto_wrap_policy is None:
         return model
-    for i, block in enumerate(model.blocks):
-        model.blocks[i] = checkpoint_module(block)
+
+    auto_wrap_policy = functools.partial(
+        transformer_auto_wrap_policy,
+        transformer_layer_cls={LeoBlock},
+    )
+
+    auto_wrapper_callable = lambda m, *args, **kwargs: FSDP(
+        checkpoint_module(m), *args, **kwargs
+    )
+
     wrapped = FSDP(
         model,
+        auto_wrap_policy      = auto_wrap_policy,
+        auto_wrapper_callable = auto_wrapper_callable,
         reshard_after_forward = True,
-        flatten_parameters    = True,
+        flatten_parameters    = False,
     )
     xm.rendezvous("fsdp_init")
-    xm.master_print("   FSDP: OK (32 blocks checkpointed, 8-chip sharding)")
+    xm.master_print("   FSDP: OK (nested per-block, gradient checkpointing, 8-chip ZeRO-3)")
     return wrapped
 
 
@@ -197,7 +210,7 @@ def run_phase(phase, model, optimizer, dataset, loss_fn,
 
             if (step + 1) % grad_accum == 0:
                 if XLA_AVAILABLE:
-                    xm.optimizer_step(optimizer, barrier=True)
+                    optimizer.step()
                     xm.mark_step()
                 else:
                     torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
