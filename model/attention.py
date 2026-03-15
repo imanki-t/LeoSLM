@@ -156,7 +156,7 @@ class MultiHeadLatentAttention(nn.Module):
 
     def _sliding_window_attn(self, Q, K, V, window: int) -> torch.Tensor:
         B, nH, T, hd = Q.shape
-        out    = torch.zeros_like(Q)
+        out    = torch.zeros_like(V)
         half_w = window // 2
         chunk  = self.cfg.chunk_size
 
@@ -190,7 +190,7 @@ class MultiHeadLatentAttention(nn.Module):
 
     def _chunked_causal_attn(self, Q, K, V) -> torch.Tensor:
         B, nH, T, hd = Q.shape
-        out   = torch.zeros_like(Q)
+        out   = torch.zeros_like(V)
         chunk = self.cfg.chunk_size
 
         for ci in range(math.ceil(T / chunk)):
