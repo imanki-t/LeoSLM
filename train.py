@@ -12,7 +12,6 @@ import time
 import argparse
 from pathlib import Path
 from typing import Dict
-from functools import partial
 
 import torch
 import torch.nn as nn
@@ -52,7 +51,6 @@ except ImportError:
     from transformers.optimization import Adafactor
 
 from model    import LeoSLM, LeoConfig, CFG, LEO_IDENTITY
-from model    import LeoBlock
 from training import LeoLoss, GRPOTrainer, AgenticGRPO
 from data     import LeoDataset
 
@@ -143,16 +141,11 @@ def wrap_fsdp(model: nn.Module) -> nn.Module:
     if not XLA_AVAILABLE or FSDP is None:
         return model
 
-    for block in model.blocks:
-        block.__class__ = checkpoint_module(block.__class__)
+    for i, block in enumerate(model.blocks):
+        model.blocks[i] = checkpoint_module(block)
 
-    auto_wrap_policy = partial(
-        torch_xla.distributed.fsdp.wrap.transformer_auto_wrap_policy,
-        transformer_layer_cls={LeoBlock},
-    )
     wrapped = FSDP(
         model,
-        auto_wrap_policy      = auto_wrap_policy,
         reshard_after_forward = True,
         flatten_parameters    = True,
     )
