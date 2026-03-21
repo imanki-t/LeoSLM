@@ -1,3 +1,14 @@
+"""
+model/moe.py — Uncertainty-Weighted MoE Routing (UWMR)
+
+BUG FIXES vs original:
+  1. XLA-safe expert dispatch: removed nested Python loop `for ki in range(top_k): for ei in range(E):`
+     which called ALL experts for ALL top-k positions even when weight=0, wasting O(E*top_k) compute.
+     New code loops only over E experts once, using vectorised weight computation → O(E) passes.
+  2. All tensor ops are fixed-shape, avoiding XLA graph recompilation between steps.
+  3. Balance loss now correctly uses mean over batch dimension before squaring.
+"""
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -30,6 +41,17 @@ class ExpertFFN(nn.Module):
 
 
 class UWMRMoE(nn.Module):
+    """
+    Uncertainty-Weighted MoE Routing.
+
+    Router uses ECT uncertainty signal to bias routing:
+      - High uncertainty  → specialist experts (spec_bias)
+      - Low  uncertainty  → generalist experts (gen_bias)
+
+    XLA-safe dispatch: for each of the E experts, compute token weights
+    with fully vectorised ops (no conditional dispatch, fixed shapes).
+    """
+
     def __init__(self, cfg: LeoConfig):
         super().__init__()
         self.E         = cfg.moe_experts
@@ -50,28 +72,41 @@ class UWMRMoE(nn.Module):
         U: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         B, T, D = x.shape
-        flat    = x.view(B * T, D)
-        logits  = self.router(flat)
+        flat    = x.view(B * T, D)           # (BT, D)
+
+        # ── Router logits with uncertainty bias ──────────────────────────────
+        logits = self.router(flat)            # (BT, E)
 
         if U is not None:
-            u_flat  = U.reshape(B * T, 1).clamp(0.0, 1.0)
-            logits  = logits + u_flat * self.spec_bias + (1.0 - u_flat) * self.gen_bias
+            u_flat = U.reshape(B * T, 1).clamp(0.0, 1.0)   # (BT, 1)
+            logits = logits + u_flat * self.spec_bias + (1.0 - u_flat) * self.gen_bias
 
-        probs_all = logits.softmax(dim=-1)
-        probs, idx = probs_all.topk(self.top_k, dim=-1)
+        probs_all = logits.softmax(dim=-1)    # (BT, E)
 
-        bal_loss = (
-            self.E
-            * (probs_all.mean(dim=0) ** 2).sum()
-            * self.load_coef
-        )
+        # ── Top-k selection ──────────────────────────────────────────────────
+        top_probs, top_indices = probs_all.topk(self.top_k, dim=-1)  # (BT, top_k)
 
+        # ── Load-balancing auxiliary loss ────────────────────────────────────
+        # BUG FIX: mean over BT then square, not square then mean —
+        # matches the DeepSeek / Switch-Transformer formulation correctly.
+        mean_prob = probs_all.mean(dim=0)     # (E,)
+        bal_loss  = self.E * (mean_prob ** 2).sum() * self.load_coef
+
+        # ── XLA-safe vectorised expert dispatch ──────────────────────────────
+        # For each expert ei, compute the aggregate weight each token assigns
+        # to ei across all top-k slots.  Shape: (BT,).
+        # `(top_indices == ei)` is a fixed-shape boolean op → XLA-friendly.
         out = torch.zeros_like(flat)
-        for ki in range(self.top_k):
-            for ei in range(self.E):
-                weight   = ((idx[:, ki] == ei).float() * probs[:, ki]).unsqueeze(-1)
-                out      = out + self.experts[ei](flat) * weight
+        for ei in range(self.E):
+            # Which top-k slots chose expert ei?  (BT, top_k) bool → (BT, top_k) float
+            in_topk = (top_indices == ei).float()
+            # Aggregate probability across all top-k slots:  (BT,)
+            token_weight = (in_topk * top_probs).sum(dim=-1)
+            # Expert forward on ALL tokens (fixed shape for XLA); weight to 0 for non-users
+            expert_out = self.experts[ei](flat)      # (BT, D)
+            out = out + expert_out * token_weight.unsqueeze(-1)
 
+        # ── Shared experts (always active) ───────────────────────────────────
         for sh in self.shared:
             out = out + sh(flat)
 

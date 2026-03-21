@@ -1,3 +1,16 @@
+"""
+model/agentic.py — Agentic Confidence-Gated Invocation (ACGI)
+
+No bugs found. Verified shapes and logic. Added comments.
+
+ACGI is the architectural gate that forces tool invocation when
+ECT uncertainty exceeds a threshold.  High uncertainty → the model
+MUST call a tool rather than emit a potentially hallucinated answer.
+
+ESTR (ECT-Seeded Tool Routing): the ECT domain representations
+bias which tool class to call, routing specialist vs generalist.
+"""
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -16,55 +29,70 @@ class AgenticConfidenceGatedInvocation(nn.Module):
     def __init__(self, cfg: LeoConfig):
         super().__init__()
         D              = cfg.hidden_dim
-        self.threshold = cfg.acgi_threshold
+        self.threshold = cfg.acgi_threshold   # U > threshold → gate fires
         self.n_tools   = len(self.TOOL_CLASSES)
 
         self.tool_embeds = nn.Embedding(self.n_tools, D)
 
+        # Gate: (D + 1) → 1 probability (include U as explicit feature)
         self.gate = nn.Sequential(
             nn.Linear(D + 1, 64), nn.GELU(),
             nn.Linear(64, 1),     nn.Sigmoid(),
         )
 
-        self.router     = nn.Linear(D, self.n_tools)
+        # Router: which tool class to call
+        self.router = nn.Linear(D, self.n_tools)
+
+        # ESTR: ECT domain → tool routing bias
+        # ect_h is (B, E, D); mean over D gives (B, E)
+        # estr_align: (num_ect=E,) → (n_tools,)
         self.estr_align = nn.Linear(cfg.num_ect, self.n_tools, bias=False)
 
     def forward(
         self,
-        hidden: torch.Tensor,
-        U:      torch.Tensor,
-        ect_h:  torch.Tensor,
+        hidden: torch.Tensor,   # (B, T, D)
+        U:      torch.Tensor,   # (B, T)
+        ect_h:  torch.Tensor,   # (B, E, D)
     ) -> Dict[str, torch.Tensor]:
         B, T, D = hidden.shape
 
-        u_feat     = U.unsqueeze(-1)
-        gate_score = self.gate(torch.cat([hidden, u_feat], dim=-1)).squeeze(-1)
+        # Gate probability per position
+        u_feat     = U.unsqueeze(-1)                                  # (B, T, 1)
+        gate_score = self.gate(torch.cat([hidden, u_feat], dim=-1)).squeeze(-1)  # (B, T)
 
-        gate_mask = (gate_score > 0.5) & (U > self.threshold)
+        # Binary gate mask: fire when both gate and raw uncertainty are high
+        gate_mask = (gate_score > 0.5) & (U > self.threshold)        # (B, T) bool
 
-        tool_logits = self.router(hidden)
+        # Tool class logits
+        tool_logits = self.router(hidden)                              # (B, T, n_tools)
 
-        ect_domain = ect_h.mean(dim=-1)
-        estr_bias  = self.estr_align(ect_domain).unsqueeze(1).expand(-1, T, -1)
+        # ESTR bias: ECT domain → tool routing preference
+        # ect_h: (B, E, D) → mean over D → (B, E) → estr_align → (B, n_tools)
+        ect_domain = ect_h.mean(dim=-1)                               # (B, E)
+        estr_bias  = self.estr_align(ect_domain).unsqueeze(1).expand(-1, T, -1)  # (B, T, n_tools)
 
         return {
-            "gate_score":  gate_score,
-            "gate_mask":   gate_mask,
-            "tool_logits": tool_logits + estr_bias,
-            "estr_bias":   estr_bias,
+            "gate_score":  gate_score,                                # (B, T)
+            "gate_mask":   gate_mask,                                 # (B, T)
+            "tool_logits": tool_logits + estr_bias,                   # (B, T, n_tools)
+            "estr_bias":   estr_bias,                                 # (B, T, n_tools)
         }
 
     def tool_call_loss(
         self,
-        gate_score:  torch.Tensor,
-        U:           torch.Tensor,
-        tool_logits: torch.Tensor,
-        tool_labels: Optional[torch.Tensor] = None,
+        gate_score:  torch.Tensor,            # (B, T)
+        U:           torch.Tensor,            # (B, T)
+        tool_logits: torch.Tensor,            # (B, T, n_tools)
+        tool_labels: Optional[torch.Tensor] = None,  # (B, T) int, -1 = ignore
     ) -> torch.Tensor:
-        target_gate = (U > self.threshold).float()
-        l_gate      = F.binary_cross_entropy(gate_score.clamp(1e-6, 1 - 1e-6), target_gate)
-        l_tool      = gate_score.new_zeros(1)
+        """
+        Gate calibration loss: gate_score should predict whether U > threshold.
+        Optionally supervised with ground-truth tool class labels.
+        """
+        target = (U > self.threshold).float()
+        l_gate = F.binary_cross_entropy(gate_score.clamp(1e-6, 1 - 1e-6), target)
 
+        l_tool = gate_score.new_zeros(1)
         if tool_logits is not None and tool_labels is not None:
             flat_l = tool_logits.view(-1, self.n_tools)
             flat_t = tool_labels.view(-1)
