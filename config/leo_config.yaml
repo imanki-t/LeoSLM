@@ -2,253 +2,225 @@
 # ║              LeoSLM "Aether"  —  FRONTIER CLASS  |  Built by Unmuted        ║
 # ╠═══════════════════════════════════════════════════════════════════════════════╣
 # ║  Hardware   : Kaggle TPU v5e-8  | 128 GB HBM | ~1,576 TFLOPS BF16          ║
-# ║  Model      : ~3.1B total | ~1.9B active | BF16 | XLA-optimised            ║
-# ║  Context    : 32,768 trained | 131,072 via YaRN at inference               ║
-# ║  Data       : 2.1B tokens | 6 sources | LeoTokenizer (65,536 vocab)        ║
-# ║  Framework  : PyTorch/XLA + FSDP + Adafactor + XLA-JIT                    ║
+# ║  Model      : ~3.1B total | ~1.9B active (MoE top-2/8) | BF16              ║
+# ║  Context    : 32,768 trained | 131,072 via YaRN at inference                ║
+# ║  Data       : 2.1B tokens | 6 sources | LeoTokenizer (65,543 vocab)        ║
+# ║  Framework  : PyTorch/XLA + xmp.spawn (8 workers) + Adafactor              ║
 # ╠═══════════════════════════════════════════════════════════════════════════════╣
 # ║  COMPETITION TARGET: Claude Haiku 4.5 / Gemini 2.5 Flash Lite              ║
-# ╠═══════════════════════════════════════════════════════════════════════════════╣
-# ║  WHAT'S NEW IN AETHER                                                        ║
-# ║  • LeoTokenizer — custom BPE 65,536 vocab trained on our own data          ║
-# ║  • Deep Think Mode — <think>...</think> with GRPO RL (Phase 6)            ║
-# ║  • Agentic post-training — Phases 7 + 8: tool-use SFT + GRPO RL           ║
-# ║  • ACGI — Agentic Confidence-Gated Invocation (novel, no prior art)       ║
-# ║  • SAM  — Structured Agentic Memory (tool interaction pair compression)    ║
-# ║  • ESTR — ECT-Seeded Tool Routing (ECT domain → tool class)               ║
-# ║  • TTIP — Think-Tool Interleaving Protocol (tools mid-<think>)            ║
-# ║  • MSRA — Multi-Step Reward Attribution (backward credit through traj.)   ║
-# ║  • MTP  — Multi-Token Prediction (DeepSeek V3 style, built-in spec dec)   ║
-# ║  • DSA-lite — Derived Sparse Attention (XLA-safe, activates >32k ctx)    ║
-# ║  • Leo has an identity: knows he is Leo, built by Unmuted                  ║
-# ║  • 5 new agentic special tokens (tool_call, tool_result, system)           ║
 # ╚═══════════════════════════════════════════════════════════════════════════════╝
+#
+# NOTE: This file is documentation + leo_rag.py config only.
+#       train.py / model code use model/config.py (Python dataclass) directly.
+#       All field names here are kept in sync with LeoConfig for clarity.
 
 # ───────────────────────────────────────────────────────────────────────────────
-# TOKENIZER  — LeoTokenizer (custom BPE, not GPT-2)
+# TOKENIZER — LeoTokenizer (custom BPE, not GPT-2)
 # ───────────────────────────────────────────────────────────────────────────────
+# FIX: vocab_size was 65536 — wrong. Correct value is 65543.
+# prep_data.py trains BPE with base_vocab=65529 (IDs 0..65528), then
+# add_special_tokens() appends 14 specials at IDs 65529..65542 → total 65543.
 tokenizer:
-  type:         bpe              # Byte-Pair Encoding (same as Qwen3, Llama4, Gemini)
-  vocab_size:   65536            # 65k — larger than GPT-2 (50k), smaller than GPT-4 (100k)
-                                 # Sweet spot: enough coverage, fits uint16 (max 65535→65534)
-  train_data:   ./data/tok_sample.txt   # 1% sample of training data for tok training
-  # Single-digit number tokens (like Llama 2+ and GPT-4): every digit 0-9 is its own token
-  # Three-digit number tokens: 0-999 each get own token (like GPT-4/tiktoken)
-  # This prevents arithmetic tokenization failures (the "strawberry" problem)
-  digit_tokens:     true         # Digits 0-9 are always single tokens
-  number_tokens:    true         # 000-999 always single tokens → better math
-  # Special tokens (all native from token 0, not afterthoughts)
+  type:           bpe
+  vocab_size:     65543            # 65529 base BPE + 14 special tokens = 65543
+  base_bpe_vocab: 65529            # BpeTrainer target (NO specials in trainer)
+  train_data:     ./data/tok_sample.txt
+  digit_tokens:   true
+  number_tokens:  true
+  # Special tokens — appended AFTER BPE training via add_special_tokens()
+  # IDs are APPENDED sequentially starting at base_bpe_vocab (65529)
   special_tokens:
-    pad:      "[PAD]"        # 65529
-    unk:      "[UNK]"        # 65530
-    bos:      "[BOS]"        # 65531 — beginning of sequence
-    eos:      "[EOS]"        # 65532 — end of sequence
-    mask:     "[MASK]"       # 65533 — diffusion masking
-    idk:      "[IDK]"        # 65534 — "I don't know" — NATIVE from token training
-    think:    "<think>"      # 65535 — Deep Think start — NATIVE
-    end_think: "</think>"   # 65536? → we use 65535 + 65534 range; see note below
-  # NOTE: we use vocab_size=65538 to fit these 8 specials above 65529
-  # uint16 can hold 0-65535, so we slightly over-allocate: actual file vocab = 65538
-  # The .npy files use uint32 (4 bytes) because 65538 > 65535
+    pad:              "[PAD]"          # 65529  ← cfg.pad_id
+    unk:              "[UNK]"          # 65530  ← cfg.unk_id (not in LeoConfig but tokenizer needs it)
+    bos:              "[BOS]"          # 65531  ← cfg.bos_id
+    eos:              "[EOS]"          # 65532  ← cfg.eos_id
+    mask:             "[MASK]"         # 65533  ← cfg.mask_id
+    idk:              "[IDK]"          # 65534  ← cfg.idk_id
+    think_start:      "<think>"        # 65535  ← cfg.think_start_id
+    think_end:        "</think>"       # 65536  ← cfg.think_end_id
+    tool_call_start:  "<|tool_call|>"  # 65537  ← cfg.tool_call_start
+    tool_call_end:    "<|/tool_call|>" # 65538  ← cfg.tool_call_end
+    tool_result_start:"<|tool_result|>"# 65539  ← cfg.tool_result_start
+    tool_result_end:  "<|/tool_result|>"# 65540 ← cfg.tool_result_end
+    system_start:     "<|system|>"     # 65541  ← cfg.system_start
+    system_end:       "<|/system|>"    # 65542  ← closing tag
 
 # ───────────────────────────────────────────────────────────────────────────────
 # MODEL ARCHITECTURE
 # ───────────────────────────────────────────────────────────────────────────────
+# ALL field names below match model/config.py LeoConfig dataclass exactly.
 model:
   name:    LeoSLM-Aether
   version: aether
   creator: Unmuted
 
-  # Special token IDs — all native from tokenizer training
-  pad_token_id:        65529
-  unk_token_id:        65530
-  bos_token_id:        65531
-  eos_token_id:        65532
-  mask_token_id:       65533
-  idk_token_id:        65534
-  think_start_id:      65535
-  think_end_id:        65536
-  # Agentic special tokens (Aether-native, no prior art at token level)
-  tool_call_start:     65537   # <|tool_call|>
-  tool_call_end:       65538   # <|/tool_call|>
-  tool_result_start:   65539   # <|tool_result|>
-  tool_result_end:     65540   # <|/tool_result|>
-  system_start:        65541   # <|system|>
+  # Special token IDs — must match tokenizer section above
+  pad_id:            65529
+  bos_id:            65531
+  eos_id:            65532
+  mask_id:           65533
+  idk_id:            65534
+  think_start_id:    65535
+  think_end_id:      65536
+  tool_call_start:   65537
+  tool_call_end:     65538
+  tool_result_start: 65539
+  tool_result_end:   65540
+  system_start:      65541
+  estr_domain_count: 8
 
-  vocab_size:   65543          # 65k custom + 14 specials (rounded up)
+  vocab_size:   65543          # = 65529 base + 14 specials
 
-  # ── Sequence ─────────────────────────────────────────────────────────────────
-  max_seq_len:      32768      # Trained context
-  chunk_size:       2048       # Chunked attention block size
-  think_budget_max: 8192       # Max tokens in <think>…</think> per call
-  think_budget_min: 256        # Min think tokens for hard queries
+  # ── Sequence ──────────────────────────────────────────────────────────────────
+  max_seq_len:       32768
+  chunk_size:        2048
+  think_budget_max:  8192
+  think_budget_min:  256
 
-  # ── Core dimensions ──────────────────────────────────────────────────────────
-  hidden_dim:      2560
-  num_layers:      32
-  num_dense_layers: 4          # Dense stem (stable MoE warm-up)
-  num_heads:       20
-  head_dim:        128         # hidden_dim / num_heads = 128
+  # ── Core dimensions ───────────────────────────────────────────────────────────
+  hidden_dim:       2560
+  num_layers:       32
+  num_dense_layers: 4
+  num_heads:        20
+  head_dim:         128        # hidden_dim / num_heads = 128 ✓
 
-  # ── Multi-Head Latent Attention (MLA) — DeepSeek V3 style ───────────────────
-  # MLA compresses KV into a low-rank latent: saves 70% KV cache memory
-  # c_kv = latent dim for KV compression  (DeepSeek V3 uses 512)
-  # c_q  = latent dim for Q  compression
-  use_mla:  true
-  mla_c_kv: 512                # KV latent dimension
-  mla_c_q:  768                # Q  latent dimension
-  mla_rope_dim: 64             # RoPE applied to a decoupled 64-dim head portion
+  # ── Multi-Head Latent Attention (MLA) ─────────────────────────────────────────
+  use_mla:      true
+  mla_c_kv:     512
+  mla_c_q:      768
+  mla_rope_dim: 64
 
-  # ── Hybrid attention: Sliding Window + Global ────────────────────────────────
-  # Pattern from Mistral / Gemini: local layers + global layers
-  # Local (sliding window): fast, O(window×n) — covers 85% of layers
-  # Global (full attention): O(n²) but chunked — covers 15% of layers
-  sliding_window_size: 4096    # Local layers attend to ±4096 tokens
-  global_every_n:      4       # Every 4th layer is global (8 global in 32 layers)
+  # ── Hybrid attention: Sliding Window + Global ─────────────────────────────────
+  # FIX: was sliding_window_size — correct field name is sliding_window
+  sliding_window: 4096         # local layers attend ±4096 tokens
+  global_every_n: 4            # every 4th layer is global (layers 3,7,11,...31)
 
-  # ── GQA fallback (when MLA disabled for compatibility) ───────────────────────
-  num_kv_heads:    4           # GQA groups (used in non-MLA mode)
+  # ── GQA fallback ──────────────────────────────────────────────────────────────
+  num_kv_heads: 4
 
-  # ── FFN dimensions ───────────────────────────────────────────────────────────
-  ffn_dim_dense:    6912       # Dense SwiGLU: ceil(8/3 × 2560) aligned to 64
-  ffn_dim_expert:   1024       # Expert width (8 compensate with breadth)
+  # ── FFN dimensions ────────────────────────────────────────────────────────────
+  ffn_dim_dense:  6912
+  ffn_dim_expert: 1024
 
-  # ── Mixture of Experts (UWMR-enhanced) ──────────────────────────────────────
-  moe_num_experts:        8
-  moe_top_k:              2
-  moe_shared_experts:     1    # Always-active shared (DeepSeek-style)
-  moe_load_coeff:         0.01
+  # ── Mixture of Experts (UWMR) ─────────────────────────────────────────────────
+  # FIX: moe_num_experts → moe_experts, moe_shared_experts → moe_shared
+  moe_experts:   8             # total expert count
+  moe_top_k:     2             # active experts per token
+  moe_shared:    1             # always-active shared expert (DeepSeek-style)
+  moe_load_coeff: 0.01
 
-  # Novel: Uncertainty-Weighted MoE Routing (UWMR) — retained from V3
-  uwmr_enabled:           true
-  uwmr_specialist_scale:  2.0
-  uwmr_generalist_scale:  1.0
+  # FIX: uwmr_specialist_scale → uwmr_spec_scale, uwmr_generalist_scale → uwmr_gen_scale
+  uwmr_spec_scale: 2.0         # routing bias for high-U (uncertain) tokens
+  uwmr_gen_scale:  1.0         # routing bias for low-U (confident) tokens
 
-  # ── ECT v3 — Enhanced Epistemic Confidence Tokens ────────────────────────────
-  num_ect:               8
-  ect_heads:             4
-  ect_max_total:         16    # ECT-DS hard cap
-  ect_spawn_threshold:   0.60
+  # ── ECT v3 ────────────────────────────────────────────────────────────────────
+  num_ect:   8
+  ect_heads: 4
+  # FIX: ect_max_total → ect_max, ect_spawn_threshold → ect_spawn_thresh
+  ect_max:          16
+  ect_spawn_thresh: 0.60
 
-  # ── Deep Think Mode ──────────────────────────────────────────────────────────
-  # Think tokens occupy a dedicated reasoning space before the answer.
-  # At inference: model can emit <think>…</think> then the actual answer.
-  # Training: phase 6 GRPO RL with format + accuracy rewards (DeepSeek-R1 style)
+  # ── Deep Think Mode ───────────────────────────────────────────────────────────
   deep_think:
-    enabled:            true
-    mode_token:         think_start_id   # [THINK] token triggers deep think
-    end_token:          think_end_id     # [/THINK] token closes it
-    budget_forcing:     true             # Force minimum think tokens on hard queries
-    # Difficulty scoring: ECT mean uncertainty > 0.5 → hard → use think mode
-    auto_think_threshold: 0.50
-    # GRPO reward components
-    grpo_format_reward:   1.0    # +1 for proper <think>…</think> format
-    grpo_accuracy_reward: 2.0    # +2 for correct final answer
-    grpo_factuality_reward: 1.5  # +1.5 for factually grounded answer
-    grpo_length_penalty:  0.001  # -0.001 per extra think token (efficiency incentive)
-    # Process Reward Model (PRM) — reward each CoT step
-    use_prm:              true
-    prm_hidden:           256    # Small PRM head attached to ECT output
+    enabled:               true
+    auto_think_threshold:  0.50
+    grpo_format_reward:    1.0
+    grpo_accuracy_reward:  2.0
+    grpo_factuality_reward: 1.5
+    grpo_length_penalty:   0.001
+    use_prm:               true
+    prm_hidden:            256
 
-  # ── Novel: Epistemic Positional Encoding (EPE) — retained from V3 ─────────
-  use_epe:          true
-  epe_min_scale:    0.7
-  epe_max_scale:    1.8
+  # ── EPE ───────────────────────────────────────────────────────────────────────
+  use_epe:       true
+  epe_min_scale: 0.7
+  epe_max_scale: 1.8
 
-  # ── YaRN dynamic NTK RoPE scaling ────────────────────────────────────────────
-  # Extends 32k trained context → 131k at inference with ~90% quality retention
-  # Used by Qwen3, Llama3, Mistral. Named after the paper "YaRN" (2023).
+  # ── YaRN ──────────────────────────────────────────────────────────────────────
+  use_yarn:  true
+  yarn_scale: 1.0              # set >1.0 at inference for extended context
   yarn:
-    enabled:         true
-    scale_factor:    4.0         # 32k × 4 = 128k at inference
-    beta_fast:       32
-    beta_slow:       1
-    mscale:          0.1
-    mscale_all_dim:  0.1
+    scale_factor: 4.0          # 32k × 4 = 128k at inference
+    beta_fast:    32
+    beta_slow:    1
+    mscale:       0.1
 
-  # ── Multi-Token Prediction (MTP) — DeepSeek V3 style ──────────────────────
-  # N parallel lightweight heads predict tokens t+2, t+3, ... t+N+1.
-  # Training: free auxiliary AR signal on N future positions.
-  # Inference: N drafted tokens per step → built-in speculative decoding,
-  #            no separate draft model needed.
-  use_mtp:        true
-  mtp_n:          4        # Predict 4 future tokens simultaneously
-  mtp_head_layers: 1       # Single-layer head per future position (parameter-light)
+  # ── MTP ───────────────────────────────────────────────────────────────────────
+  use_mtp:         true
+  mtp_n:           4
+  mtp_head_layers: 1
 
-  # ── DSA-lite (Derived Sparse Attention) — Aether, XLA-safe ─────────────────
-  # Activates only for sequences > dsa_threshold.
-  # Derives per-head sparse masks from cheap downsampled attention proxy.
-  # ECT uncertainty weights broadening: uncertain tokens attend more broadly.
-  use_dsa:          true
-  dsa_threshold:    32768  # Only activate for seqlens > 32k
-  dsa_top_k_pct:    0.25   # Each head attends to top 25% of positions
+  # ── DSA ───────────────────────────────────────────────────────────────────────
+  use_dsa:       true
+  dsa_threshold: 32768
+  dsa_top_k_pct: 0.25
 
-  # ── ACGI — Agentic Confidence-Gated Invocation (novel Aether) ──────────────
-  # Architecture-level agentic safety: high ECT uncertainty → forced tool call.
-  # No hallucinated answers above the threshold; must call a tool instead.
-  acgi_threshold:   0.72   # U > 0.72 triggers tool call gate
-  estr_domain_count: 8     # ECT-Seeded Tool Routing domain slots
+  # ── ACGI ──────────────────────────────────────────────────────────────────────
+  acgi_threshold:    0.72
 
-  # ── SAM — Structured Agentic Memory (novel Aether) ──────────────────────────
-  # Persistent compressed slots for tool interaction pairs.
-  # Tool call + result pair → 1 compressed D-dim slot stored in SAM bank.
-  # Prepended as prefix memory in all attention layers.
-  use_sam:          true
-  sam_memory_size:  32     # Tool interaction pair slots
+  # ── SAM ───────────────────────────────────────────────────────────────────────
+  use_sam:         true
+  sam_memory_size: 32
 
-  # ── TTIP — Think-Tool Interleaving Protocol (novel Aether) ─────────────────
-  # <|tool_call|> tokens can be emitted inside <think>...</think> blocks.
-  # Tools become first-class reasoning operations, not just post-answer actions.
-  use_ttip:         true
-  diffusion_steps:       16
-  diffusion_schedule:    cosine
-  use_logit_normal:      true
-  schedule_weight:       true
-  uncertainty_threshold: 0.35
+  # ── TDM ───────────────────────────────────────────────────────────────────────
+  use_tdm:             true
+  tdm_memory_size:     64
+  tdm_conf_threshold:  0.20
+  cmg_threshold:       0.7
 
-  # ── Regularization ───────────────────────────────────────────────────────────
-  dropout:       0.0       # No dropout — model size + data sufficient
-  weight_tying:  true      # Tie embedding ↔ LM head
+  # ── TTIP ──────────────────────────────────────────────────────────────────────
+  use_ttip: true
+
+  # ── PRM ───────────────────────────────────────────────────────────────────────
+  use_prm:    true
+  prm_hidden: 256
+
+  # ── CUR ───────────────────────────────────────────────────────────────────────
+  use_cur:       true
+  cur_max_passes: 3
+  cur_threshold:  0.05
+
+  # ── Uncertainty threshold ──────────────────────────────────────────────────────
+  # FIX: was uncertainty_threshold: 0.35 — WRONG NAME AND VALUE
+  # Correct field name: uncertainty_thresh, correct value: 0.50
+  uncertainty_thresh: 0.50
+
+  # ── Gradient checkpointing ────────────────────────────────────────────────────
+  # Enabled via --grad_ckpt flag in train.py (reduces HBM ~70%)
+  use_gradient_checkpointing: false   # set true via --grad_ckpt CLI flag
 
 # ───────────────────────────────────────────────────────────────────────────────
-# ANTI-HALLUCINATION STACK  (12 layers, active from phase 1)
+# ANTI-HALLUCINATION STACK
 # ───────────────────────────────────────────────────────────────────────────────
 anti_hallucination:
-  # Architectural (always active, baked in from layer 0)
-  ect_brier_calibration:     true   # ECT must accurately predict own error rate
-  idk_token_training:        true   # Model learns to say [IDK] instead of confabulating
-  constitutional_diffusion:  true   # Constitutional vectors condition diffusion path
-  confidence_gate_alpha:     true   # Dual-path gate prevents overconfident AR output
-  epistemic_pos_encoding:    true   # EPE: uncertain tokens seek wider context
-
-  # Training-level
-  factuality_dpo:            true   # Phase 5: DPO with factuality reward (FActScore-style)
-  grpo_factuality:           true   # Phase 6: GRPO RL with factuality component
-  self_consistency_voting:   true   # Best-of-3 diffusion samples on uncertain tokens
-  idk_sft_data:              true   # Phase 4 SFT includes explicit "I don't know" examples
-
-  # Inference-level
-  cascade_uncertainty_res:   true   # CUR: uncertain tokens resolve each other (V3)
-  constitutional_memory_gate: true  # CMG: blocks unsafe writes to TDM memory
-  contrastive_decoding:      true   # Compare draft vs final logits, suppress hallucinations
-
-  # Aether additions (from prior versions, enhanced)
-  prm_step_reward:           true   # PRM rewards correct intermediate reasoning steps
-  atomic_claim_verification: true   # During <think>: auto-verify atomic claims with ECT
+  ect_brier_calibration:      true
+  idk_token_training:         true
+  constitutional_diffusion:   true
+  confidence_gate_alpha:      true
+  epistemic_pos_encoding:     true
+  factuality_dpo:             true
+  grpo_factuality:            true
+  self_consistency_voting:    true
+  idk_sft_data:               true
+  cascade_uncertainty_res:    true
+  constitutional_memory_gate: true
+  contrastive_decoding:       true
+  prm_step_reward:            true
+  atomic_claim_verification:  true
 
 # ───────────────────────────────────────────────────────────────────────────────
-# TRAINING — 6 phases (V3 had 4)
+# TRAINING — 8 phases
 # ───────────────────────────────────────────────────────────────────────────────
 training:
-  # ── Progressive Confidence Curriculum (PCC) — 8 phases ─────────────────────
-  # Phase 1: AR warmup          4k ctx  — basic language
-  # Phase 2: Diffusion          8k ctx  — learn uncertainty
-  # Phase 3: Full MoE+ECT+MTP  16k ctx  — specialization + multi-token prediction
-  # Phase 4: SFT alignment     32k ctx  — instruction following + IDK + identity
-  # Phase 5: Factuality DPO    32k ctx  — FActScore-style preference training
-  # Phase 6: GRPO Think RL     32k ctx  — DeepSeek-R1-style CoT reinforcement
-  # Phase 7: Agentic SFT       32k ctx  — tool format, MCP, web search, TTIP
-  # Phase 8: Agentic RL        32k ctx  — GRPO + MSRA trajectory credit assignment
+  # Phase schedule (matches train.py PHASE_CFG exactly)
+  # Phase 1: AR warmup          4k ctx
+  # Phase 2: Diffusion          8k ctx
+  # Phase 3: Full MoE+ECT+MTP  16k ctx
+  # Phase 4: SFT alignment     32k ctx
+  # Phase 5: Factuality DPO    32k ctx
+  # Phase 6: GRPO Think RL     32k ctx
+  # Phase 7: Agentic SFT       32k ctx
+  # Phase 8: Agentic RL        32k ctx
   phase1_epochs: 2
   phase2_epochs: 2
   phase3_epochs: 2
@@ -261,60 +233,55 @@ training:
   phase_contexts: [4096, 8192, 16384, 32768, 32768, 32768, 32768, 32768]
   phase_tau:      [0.50,  0.45,  0.40,  0.35,  0.35,  0.30,  0.30,  0.28]
 
-  # ── Optimizer (Adafactor — TPU native) ──────────────────────────────────────
-  optimizer:    adafactor
-  lr:           1.0e-3
-  lr_min:       1.0e-4
-  weight_decay: 0.1
-  grad_clip:    1.0
-  warmup_steps: 1000
+  # ── Optimizer ──────────────────────────────────────────────────────────────────
+  optimizer:     adafactor
+  lr:            1.0e-3
+  lr_min:        1.0e-4
+  weight_decay:  0.1
+  grad_clip:     1.0
+  warmup_steps:  1000
 
-  # ── Batch ────────────────────────────────────────────────────────────────────
-  # Memory budget at 32k with MLA + chunked attn:
-  #   Params (FSDP sharded):  3.1B × 2B / 8 chips = ~775 MB/chip
-  #   Master weights (FP32):  3.1B × 4B / 8 chips = ~1550 MB/chip
-  #   Adafactor 2nd moment:   3.1B × 4B / 8 chips = ~1550 MB/chip
-  #   Gradients (BF16):       3.1B × 2B / 8 chips = ~775 MB/chip
-  #   Activations (grad ckpt): ~1.2 GB/chip
-  #   XLA workspace:           ~1.0 GB/chip
-  #   TOTAL:                   ~6.85 GB / 16 GB → 43% utilisation ✅
-  batch_size:      1      # 1 full 32k sequence per chip
-  grad_accumulation: 16   # Effective: 1 × 16 × 8 = 128 sequences per step
+  # ── Batch ──────────────────────────────────────────────────────────────────────
+  # Memory per chip at 32k context with xmp.spawn + grad checkpointing:
+  #   Params BF16:           3.1B × 2B           ≈  6.2 GB
+  #   Adafactor 2nd moment:  row-factored         ≈  1.5 GB
+  #   Activations (ckpt):                        ≈  1.2 GB
+  #   XLA workspace:                             ≈  1.0 GB
+  #   ─────────────────────────────────────────────────────
+  #   Total:                                     ≈  9.9 GB / 16 GB  ✓
+  batch_size:       1      # 1 full sequence per chip per step
+  grad_accumulation: 16   # effective batch: 1 × 16 × 8 chips = 128 sequences
 
-  # ── Memory optimizations ─────────────────────────────────────────────────────
-  mixed_precision:        true    # BF16 (TPU native)
-  gradient_checkpointing: true    # sqrt(32)=6 checkpoints
-  use_fsdp:               true    # Full sharding across 8 chips
-  fsdp_sharding:          full
-  chunk_attention:        true    # Chunked for 32k: O(chunk×n) memory
+  # ── Memory ──────────────────────────────────────────────────────────────────────
+  mixed_precision:         true    # BF16 (TPU native)
+  gradient_checkpointing:  true    # per-block recompute, enabled via --grad_ckpt
+  # FIX: use_fsdp was true — FSDP was root cause of hlo_verifier crash
+  # Now using xmp.spawn (8 workers, one per chip) with xm.optimizer_step
+  use_fsdp:  false
+  use_spmd:  false
 
   # ── Loss weights ─────────────────────────────────────────────────────────────
-  lambda_ar:      1.00
-  lambda_mdm:     0.50
-  lambda_ect:     0.10
-  lambda_const:   0.05
-  lambda_idk:     0.05
-  lambda_moe_bal: 0.01
-  lambda_ses:     0.005
-  lambda_tmd:     0.02
-  lambda_epe:     0.005
-  lambda_prm:     0.05
-  lambda_think:   0.10
-  lambda_mtp:     0.10   # Multi-Token Prediction auxiliary loss (active phase 3+)
-  lambda_acgi:    0.10   # ACGI gate calibration (active phase 7+)
-  lambda_msra:    0.05   # MSRA trajectory credit (active phase 7+)
+  # Field names match training/loss.py LeoLoss exactly
+  loss_w_ect:  0.10
+  loss_w_moe:  0.01
+  loss_w_idk:  0.10
+  loss_w_ses:  0.01
+  loss_w_mtp:  0.30
+  loss_w_prm:  0.05
+  loss_w_acgi: 0.10
+  loss_w_msra: 0.05
 
-  # ── GRPO (Phase 6) ───────────────────────────────────────────────────────────
+  # ── GRPO (Phase 6) ────────────────────────────────────────────────────────────
   grpo:
-    n_samples:          8      # Samples per question (DeepSeek-R1 uses 16, we use 8)
-    kl_coeff:           0.001  # KL penalty to stay close to reference model
-    clip_high:          0.2    # PPO-style clip
-    clip_low:           0.0
-    temperature:        1.0    # High temperature for diverse reasoning exploration
-    reward_model:       rule   # Rule-based (no neural RM — avoids reward hacking)
+    n_samples:    8
+    kl_coeff:     0.001
+    clip_high:    0.2
+    clip_low:     0.0
+    temperature:  1.0
+    reward_model: rule
 
-  # ── Checkpointing ────────────────────────────────────────────────────────────
-  save_every_steps: 100
+  # ── Checkpointing ─────────────────────────────────────────────────────────────
+  save_every_steps: 200
   eval_every_steps: 200
   checkpoint_dir:   ./checkpoints
 
@@ -325,65 +292,58 @@ data:
   train_path: ./data/train.npy
   val_path:   ./data/val.npy
   tok_path:   ./data/tok_sample.txt
-  dtype:      uint32
+  dtype:      uint32             # uint32 required: vocab IDs up to 65543 > uint16 max
   tokenizer:  ./leo_tokenizer/
 
   sources:
-    fineweb_edu:    700_000_000
-    finemath:       300_000_000
-    the_stack:      400_000_000
-    open_web_math:  200_000_000
-    dolma_books:    300_000_000
-    dolma_wiki:     200_000_000
+    fineweb_edu:   700_000_000
+    finemath:      300_000_000
+    the_stack:     400_000_000
+    open_web_math: 200_000_000
+    dolma_books:   300_000_000
+    dolma_wiki:    200_000_000
   total_tokens: 2_100_000_000
 
 # ───────────────────────────────────────────────────────────────────────────────
-# INFERENCE — all modern features
+# INFERENCE
 # ───────────────────────────────────────────────────────────────────────────────
 inference:
   temperature:  0.8
   top_k:        50
   top_p:        0.9
 
-  # Deep Think Mode (Qwen3-style switching)
-  default_mode: auto           # auto | think | nothink
-  think_trigger: "/think"      # Suffix to force think mode
-  nothink_trigger: "/nothink"  # Suffix to force fast mode
+  default_mode:      auto
+  think_trigger:     "/think"
+  nothink_trigger:   "/nothink"
 
-  # YaRN context extension
-  use_yarn:       true
-  yarn_max_len:   131072       # 128k tokens at inference
+  use_yarn:     true
+  yarn_max_len: 131072           # 128k tokens at inference via YaRN ×4
 
-  # CUR — Cascade Uncertainty Resolution (novel V3)
-  use_cur:           true
-  cur_max_passes:    3
-  cur_threshold:     0.05
+  use_cur:         true
+  cur_max_passes:  3
+  cur_threshold:   0.05
 
-  # TDM — Temporal Diffusion Memory (novel V3)
-  use_tdm:           true
-  tdm_memory_size:   64        # Increased from 32 → 64 for better retention
-  tdm_threshold:     0.20
+  use_tdm:         true
+  tdm_memory_size: 64
+  tdm_threshold:   0.20
 
-  # KV Cache with ECT-guided eviction
-  use_kv_cache:      true
-  kv_evict_uncertain: true     # Evict high-uncertainty KV pairs first
-  kv_max_length:     32768
+  use_kv_cache:       true
+  kv_evict_uncertain: true
+  kv_max_length:      32768
 
-  # ECT Dynamic Spawning
-  use_ect_spawn:     true
-  ect_spawn_thresh:  0.60
+  use_ect_spawn:    true
+  ect_spawn_thresh: 0.60
 
-  # Contrastive decoding (Aether)
-  use_contrastive:   false     # Enable when small amateur model available
-  contrastive_alpha: 0.1       # Weight of contrastive term
+  use_contrastive:   false
+  contrastive_alpha: 0.1
 
-  # Self-consistency voting
-  consistency_votes: 3
+  consistency_votes:  3
   consistency_thresh: 0.70
 
 # ───────────────────────────────────────────────────────────────────────────────
 # TPU v5e-8 HARDWARE
 # ───────────────────────────────────────────────────────────────────────────────
+# FIX: use_fsdp removed, XLA_FLAGS GPU flag removed
 tpu:
   num_chips:       8
   hbm_per_chip_gb: 16
@@ -391,37 +351,37 @@ tpu:
   tflops_bf16:     1576
   dtype:           bfloat16
   framework:       pytorch_xla
-  use_spmd:        true
-  use_fsdp:        true
-  use_compile:     false       # XLA JIT handles compilation natively
+  training_mode:   xmp_spawn    # xmp.spawn(8 workers) — correct Kaggle TPU pattern
+  use_fsdp:        false        # FIX: was true — caused hlo_verifier crash
+  use_compile:     false        # XLA JIT handles compilation natively
   xla_jit:         true
-  num_workers:     0
+  num_workers:     0            # must be 0 on Kaggle TPU (fork issues)
   env:
-    XLA_USE_BF16:                 "1"
-    XLA_TENSOR_ALLOCATOR_MAXSIZE: "1000000000"
     PJRT_DEVICE:                  "TPU"
-    XLA_FLAGS:                    "--xla_gpu_enable_triton_gemm=false"
+    XLA_TENSOR_ALLOCATOR_MAXSIZE: "1000000000"
+    TF_CPP_MIN_LOG_LEVEL:         "3"
+    # FIX: removed XLA_FLAGS --xla_gpu_enable_triton_gemm (GPU-only flag, wrong on TPU)
+    # FIX: removed XLA_USE_BF16 (deprecated, model uses .to(torch.bfloat16) instead)
 
 # ───────────────────────────────────────────────────────────────────────────────
-# LEO IDENTITY + PERSONALITY
+# LEO IDENTITY
 # ───────────────────────────────────────────────────────────────────────────────
 identity:
-  name:         Leo
-  full_name:    Leo Aether
-  creator:      Unmuted
-  version:      aether
-  description:  >
+  name:      Leo
+  full_name: Leo Aether
+  creator:   Unmuted
+  version:   aether
+  description: >
     Leo is a small language model built by Unmuted.
     Leo uses a Confidence-Gated Diffusion-AR Transformer architecture with
     Epistemic Confidence Tokens that architecturally constrain hallucination.
     Leo can think step-by-step, call tools, search the web, and use MCP servers.
     Leo was trained on 2.1B tokens across education, math, code, books, and Wikipedia.
-  personality:  >
+  personality: >
     Direct, honest, curious, and calibrated.
     Leo acknowledges uncertainty rather than confabulating.
     Leo enjoys reasoning inside its think blocks.
     Leo knows it was built by Unmuted and says so.
-  # This is injected as the first system message at inference (Phase 4 SFT bakes it in)
   system_prompt: >
     You are Leo, a language model built by Unmuted. Your full name is Leo Aether.
     You have approximately 3.1 billion parameters and were trained on 2.1 billion tokens.
@@ -432,73 +392,51 @@ identity:
 # ───────────────────────────────────────────────────────────────────────────────
 # EXTERNAL KNOWLEDGE + RAG + CUSTOM INSTRUCTIONS
 # ───────────────────────────────────────────────────────────────────────────────
-# These are EXTERNAL integrations — they plug into Leo at inference time,
-# not baked into weights. Connect them after training by pointing to real backends.
-# The RAGManager and KnowledgeInjector in leo_rag.py handle all integration.
-# ───────────────────────────────────────────────────────────────────────────────
 external_knowledge:
-  enabled:  false        # Flip to true once backend is connected
+  enabled: false       # flip to true after training to activate RAG / tools
 
-  # ── Custom Instructions ───────────────────────────────────────────────────
-  # Static text prepended to every conversation as additional system context.
-  # Use-case: persona overrides, domain rules, operator instructions.
   custom_instructions:
-    enabled:  false
-    path:     ./knowledge/instructions.txt   # Plain text, one instruction per line
-    # Alternatively, set inline (takes precedence over path):
-    inline:   null
+    enabled: false
+    path:    ./knowledge/instructions.txt
+    inline:  null
 
-  # ── RAG — Retrieval-Augmented Generation ──────────────────────────────────
-  # At inference: query → retrieve top-k chunks → prepend to context window.
-  # Leo sees retrieved context inside <|retrieved|>...</|retrieved|> tags
-  # (new inference-only tags, not trained tokens — handled by RAGManager wrapper).
   rag:
     enabled:     false
-    backend:     chroma           # chroma | faiss | pinecone | weaviate | qdrant | custom
-    index_path:  ./knowledge/index/   # Local vector store directory
+    backend:     chroma
+    index_path:  ./knowledge/index/
     collection:  leo_knowledge
-    top_k:       5                # Number of chunks to retrieve per query
-    max_tokens:  2048             # Max tokens of retrieved context per call
-    similarity:  cosine           # cosine | dot | l2
-    embed_model: sentence-transformers/all-MiniLM-L6-v2   # Embedding model for indexing
-    # Remote backend connection (leave null for local)
+    top_k:       5
+    max_tokens:  2048
+    similarity:  cosine
+    embed_model: sentence-transformers/all-MiniLM-L6-v2
     api_url:     null
     api_key:     null
 
-  # ── Document Store (offline indexing pipeline) ────────────────────────────
-  # Point at a folder of files → leo_rag.py indexes them automatically.
   document_store:
-    enabled:       false
-    source_dir:    ./knowledge/documents/   # PDFs, .txt, .md, .html
-    chunk_size:    512                      # Tokens per chunk
-    chunk_overlap: 64                       # Overlap between chunks
+    enabled:        false
+    source_dir:     ./knowledge/documents/
+    chunk_size:     512
+    chunk_overlap:  64
     supported_types: [pdf, txt, md, html, docx, json, csv]
 
-  # ── MCP Tool Servers (external, connect post-training) ────────────────────
-  # Each entry is a tool server Leo can call via ACGI / TTIP at inference.
-  # Just define the schema here; actual connection is in leo_tools.py.
   mcp_servers:
-    - name:     web_search
-      enabled:  false
-      url:      null             # e.g. http://localhost:8080/mcp
-      auth:     null
-    - name:     code_exec
-      enabled:  false
-      url:      null
-      auth:     null
-    - name:     file_io
-      enabled:  false
-      url:      null
-      auth:     null
-    - name:     custom
-      enabled:  false
-      url:      null
-      auth:     null
+    - name: web_search
+      enabled: false
+      url:  null
+      auth: null
+    - name: code_exec
+      enabled: false
+      url:  null
+      auth: null
+    - name: file_io
+      enabled: false
+      url:  null
+      auth: null
+    - name: custom
+      enabled: false
+      url:  null
+      auth: null
 
-  # ── Custom Function Calling ────────────────────────────────────────────────
-  # Register Python functions Leo can call via ACGI gate.
-  # Each function is described by a JSON schema (OpenAI function-calling style).
-  # Actual implementations go in leo_tools.py — Leo just calls the schema names.
   custom_functions:
     enabled:  false
-    registry: ./knowledge/functions.json   # Array of {name, description, parameters} objects
+    registry: ./knowledge/functions.json
