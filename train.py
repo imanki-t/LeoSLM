@@ -45,6 +45,12 @@ os.environ.setdefault("GRPC_VERBOSITY",               "ERROR")
 os.environ.pop("XLA_FLAGS",    None)
 os.environ.pop("XLA_USE_BF16", None)
 
+# ──────────────────────────────────────────────────────────────────────────────
+# KAGGLE TPU v5e-8 FIX: Prevent PJRT from assuming a multi-host Pod topology
+# ──────────────────────────────────────────────────────────────────────────────
+os.environ.pop("TPU_PROCESS_ADDRESSES", None)
+os.environ.pop("CLOUD_TPU_TASK_ID", None)
+
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader, DistributedSampler
@@ -59,12 +65,12 @@ except ImportError:
     XLA_AVAILABLE = False
     pl = xmp = None
     class _XM:
-        def xla_device(self):              return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        def xla_device(self):             return torch.device("cuda" if torch.cuda.is_available() else "cpu")
         def optimizer_step(self, o, **k): torch.nn.utils.clip_grad_norm_(o.param_groups[0]["params"], 1.0); o.step()
         def mark_step(self):              pass
         def get_ordinal(self):            return 0
         def xrt_world_size(self):         return 1
-        def master_print(self, *a, **k): print(*a, **k)
+        def master_print(self, *a, **k):  print(*a, **k)
         def rendezvous(self, t):          pass
         def is_master_ordinal(self):      return True
         def save(self, obj, path, **k):   torch.save(obj, path)
@@ -392,3 +398,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+                                                
