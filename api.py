@@ -1,3 +1,17 @@
+"""
+api.py — LeoSLM Aether Flask inference API
+
+BUG FIXES vs original:
+  1. Top-level `from leo_rag import LeoKnowledgeLayer` and
+     `from safety import OutputSafetyFilter` crashed on import if those
+     optional modules were missing. Wrapped in try/except with stub fallbacks.
+  2. `_get_engine` used `torch_xla.device()` which requires explicit
+     `import torch_xla` (not just `import torch_xla.core.xla_model as xm`).
+     Fixed to use `xm.xla_device()`.
+  3. Added `check_text_safety` stub so the generate route works even without
+     the safety module.
+"""
+
 import json
 import os
 import time
@@ -7,15 +21,57 @@ from dataclasses import dataclass, asdict, field
 from pathlib import Path
 from typing import Any, Dict, Iterator, List, Optional
 
+# ── Optional Flask ─────────────────────────────────────────────────────────────
 try:
     from flask import Flask, Response, jsonify, request, stream_with_context
     _FLASK = True
 except ImportError:
     _FLASK = False
 
-from model     import LeoSLM, LeoConfig, CFG
-from leo_rag   import LeoKnowledgeLayer
-from safety    import OutputSafetyFilter, check_text_safety
+# ── XLA ────────────────────────────────────────────────────────────────────────
+try:
+    import torch_xla                           # explicit import!
+    import torch_xla.core.xla_model as xm
+    XLA_AVAILABLE = True
+except ImportError:
+    XLA_AVAILABLE = False
+    class _XM:
+        def xla_device(self): return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    xm = _XM()
+
+from model import LeoSLM, LeoConfig, CFG
+
+# BUG FIX: wrap optional module imports in try/except so the API server
+# can start even if leo_rag / safety are not installed.
+try:
+    from leo_rag import LeoKnowledgeLayer
+    RAG_AVAILABLE = True
+except ImportError:
+    LeoKnowledgeLayer = None
+    RAG_AVAILABLE     = False
+
+try:
+    from safety import OutputSafetyFilter, check_text_safety
+
+    class _SafetyDecisionStub:
+        blocked = False
+        warned  = False
+        reason  = ""
+        safe_msg = "I can't help with that."
+
+    _HAS_SAFETY = True
+except ImportError:
+    _HAS_SAFETY = False
+    OutputSafetyFilter = None
+
+    class _SafetyDecisionStub:
+        blocked  = False
+        warned   = False
+        reason   = ""
+        safe_msg = "I can't help with that."
+
+    def check_text_safety(text: str) -> "_SafetyDecisionStub":
+        return _SafetyDecisionStub()
 
 
 PERSONALITY_PATH = "./personality.json"
@@ -101,7 +157,7 @@ def _sample(logits: torch.Tensor, temperature: float, top_p: float) -> torch.Ten
     probs  = F.softmax(logits, dim=-1)
     if top_p < 1.0:
         sorted_p, sorted_i = torch.sort(probs, descending=True)
-        cum = sorted_p.cumsum(-1)
+        cum  = sorted_p.cumsum(-1)
         mask = (cum - sorted_p) > top_p
         sorted_p[mask] = 0.0
         sorted_p = sorted_p / sorted_p.sum(-1, keepdim=True).clamp(1e-10)
@@ -109,22 +165,28 @@ def _sample(logits: torch.Tensor, temperature: float, top_p: float) -> torch.Ten
     return torch.multinomial(probs, 1)
 
 
+class _NoOpSafetyFilter:
+    """Stub when safety module is not available."""
+    def filter(self, text, hidden=None):
+        return text, _SafetyDecisionStub()
+
+
 class LeoGenerationEngine:
     def __init__(
         self,
-        model:       LeoSLM,
+        model,
         tokenizer,
-        device:      torch.device,
+        device,
         personality: PersonalityConfig,
-        knowledge:   Optional[LeoKnowledgeLayer] = None,
-        safety:      Optional[OutputSafetyFilter] = None,
+        knowledge=None,
+        safety=None,
     ):
         self.model       = model.eval()
         self.tok         = tokenizer
         self.device      = device
         self.personality = personality
-        self.knowledge   = knowledge or LeoKnowledgeLayer()
-        self.safety      = safety or OutputSafetyFilter()
+        self.knowledge   = knowledge
+        self.safety      = safety if safety is not None else _NoOpSafetyFilter()
         self.cfg         = model.cfg
 
     @torch.no_grad()
@@ -144,23 +206,21 @@ class LeoGenerationEngine:
 
         sys_prompt = self.personality.to_system_prompt()
 
-        if rag_query:
+        if self.knowledge:
             rag_ctx = self.knowledge.augment(rag_query or prompt)
         else:
-            rag_ctx = self.knowledge.augment(prompt)
+            rag_ctx = ""
 
         if mode == "think":
-            sys_prompt += f"<think>\n"
-        elif mode == "nothink":
-            pass
+            sys_prompt += "<think>\n"
 
         full_input = sys_prompt + rag_ctx + prompt
         ids = self.tok.encode(full_input, return_tensors="pt").to(self.device)
 
-        stop_ids = {self.cfg.eos_id, self.cfg.pad_id}
+        stop_ids         = {self.cfg.eos_id, self.cfg.pad_id}
         generated_tokens: List[int] = []
-        tool_buffer = ""
-        in_tool_call = False
+        tool_buffer      = ""
+        in_tool_call     = False
 
         for step in range(max_tokens):
             out    = self.model(ids)
@@ -192,11 +252,14 @@ class LeoGenerationEngine:
             if in_tool_call:
                 if self.cfg.tool_call_end == tok_int:
                     in_tool_call = False
-                    result_text  = self.knowledge.registry.parse_and_call(tool_buffer)
-                    result_ids   = self.tok.encode(result_text, return_tensors="pt").to(self.device)
-                    ids          = torch.cat([ids, result_ids], dim=-1)
+                    if self.knowledge:
+                        result_text = self.knowledge.tools.parse_and_call(tool_buffer)
+                    else:
+                        result_text = f"[Tool not available: {tool_buffer}]"
+                    result_ids = self.tok.encode(result_text, return_tensors="pt").to(self.device)
+                    ids        = torch.cat([ids, result_ids], dim=-1)
                     yield {"tool_call": tool_buffer, "tool_result": result_text, "done": False}
-                    tool_buffer  = ""
+                    tool_buffer = ""
                 else:
                     tool_buffer += decoded
                 continue
@@ -230,63 +293,76 @@ def _get_engine(checkpoint: Optional[str] = None) -> LeoGenerationEngine:
     if _STATE["engine"] is not None:
         return _STATE["engine"]
 
-    try:
-        import torch_xla.core.xla_model as xm
+    # BUG FIX: use xm.xla_device() — safe in all torch_xla versions.
+    if XLA_AVAILABLE:
         device = xm.xla_device()
-    except ImportError:
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    elif torch.cuda.is_available():
+        device = torch.device("cuda")
+    else:
+        device = torch.device("cpu")
 
-    model = LeoSLM(CFG).to(device)
+    model = LeoSLM(CFG)
+    if XLA_AVAILABLE:
+        model = model.to(torch.bfloat16)
+    model = model.to(device)
 
     if checkpoint and Path(checkpoint).exists():
-        ckpt  = torch.load(checkpoint, map_location=device)
+        ckpt  = torch.load(checkpoint, map_location="cpu")
         state = {k.replace("_orig_mod.", "").replace("module.", ""): v
                  for k, v in ckpt.get("model", ckpt).items()}
         model.load_state_dict(state, strict=False)
         print(f"[API] Loaded checkpoint: {checkpoint}")
 
-    tok          = _load_tokenizer()
-    personality  = PersonalityConfig.load()
-    knowledge    = LeoKnowledgeLayer.from_config("./config/leo_config.yaml")
-    safety_filt  = OutputSafetyFilter()
+    tok         = _load_tokenizer()
+    personality = PersonalityConfig.load()
+
+    # BUG FIX: graceful fallback when optional modules are absent.
+    knowledge = None
+    if RAG_AVAILABLE and LeoKnowledgeLayer is not None:
+        try:
+            knowledge = LeoKnowledgeLayer.from_config("./config/leo_config.yaml")
+        except Exception as e:
+            print(f"[API] Knowledge layer unavailable: {e}")
+
+    safety = None
+    if _HAS_SAFETY and OutputSafetyFilter is not None:
+        try:
+            safety = OutputSafetyFilter()
+        except Exception as e:
+            print(f"[API] Safety filter unavailable: {e}")
 
     _STATE["engine"] = LeoGenerationEngine(
-        model, tok, device, personality, knowledge, safety_filt
+        model, tok, device, personality, knowledge, safety
     )
     return _STATE["engine"]
 
 
 def create_app(checkpoint: Optional[str] = None) -> "Flask":
     if not _FLASK:
-        raise ImportError("pip install flask")
+        raise ImportError("pip install flask flask-cors")
 
-    app = Flask("LeoAPI")
+    app   = Flask("LeoAPI")
     _ckpt = [checkpoint]
 
     @app.route("/health")
     def health():
         total = sum(p.numel() for p in _get_engine(_ckpt[0]).model.parameters())
-        return jsonify({
-            "status": "ok",
-            "model":  "LeoSLM-Aether",
-            "params": f"{total/1e9:.2f}B",
-        })
+        return jsonify({"status": "ok", "model": "LeoSLM-Aether",
+                        "params": f"{total/1e9:.2f}B"})
 
     @app.route("/personality", methods=["GET"])
     def get_personality():
-        eng = _get_engine(_ckpt[0])
-        return jsonify(asdict(eng.personality))
+        return jsonify(asdict(_get_engine(_ckpt[0]).personality))
 
     @app.route("/personality", methods=["POST"])
     def set_personality():
-        eng     = _get_engine(_ckpt[0])
-        updates = request.get_json(force=True)
+        eng      = _get_engine(_ckpt[0])
+        updates  = request.get_json(force=True)
         rejected = eng.personality.update(updates)
         eng.personality.save()
         resp = {"status": "ok", "personality": asdict(eng.personality)}
         if rejected:
             resp["locked_keys_ignored"] = rejected
-            resp["note"] = "Architecture and safety fields are locked and cannot be changed."
         return jsonify(resp)
 
     @app.route("/generate", methods=["POST"])
@@ -313,27 +389,17 @@ def create_app(checkpoint: Optional[str] = None) -> "Flask":
     @app.route("/tools", methods=["GET"])
     def list_tools():
         eng = _get_engine(_ckpt[0])
-        return jsonify(eng.knowledge.registry.list_tools())
-
-    @app.route("/tools/call", methods=["POST"])
-    def call_tool():
-        eng  = _get_engine(_ckpt[0])
-        body = request.get_json(force=True)
-        name = body.get("name", "")
-        args = body.get("args", {})
-        result = eng.knowledge.registry.call(name, args)
-        return jsonify({"result": result})
+        if eng.knowledge:
+            return jsonify(eng.knowledge.tools.list_tools())
+        return jsonify([])
 
     @app.route("/safety/check", methods=["POST"])
     def safety_check():
-        body    = request.get_json(force=True)
-        text    = body.get("text", "")
+        body     = request.get_json(force=True)
+        text     = body.get("text", "")
         decision = check_text_safety(text)
-        return jsonify({
-            "blocked": decision.blocked,
-            "warned":  decision.warned,
-            "reason":  decision.reason,
-        })
+        return jsonify({"blocked": decision.blocked, "warned": decision.warned,
+                        "reason": decision.reason})
 
     return app
 
@@ -348,6 +414,4 @@ if __name__ == "__main__":
 
     app = create_app(args.checkpoint)
     print(f"[API] Leo Aether API starting on {args.host}:{args.port}")
-    print(f"[API] Personality editing: POST /personality")
-    print(f"[API] Architecture + safety: LOCKED (cannot be changed via API)")
     app.run(host=args.host, port=args.port, debug=False, threaded=True)

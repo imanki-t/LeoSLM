@@ -8,7 +8,11 @@ from typing import Dict, List, Optional, Tuple
 
 os.environ.setdefault("PJRT_DEVICE", "TPU")
 
+# ── XLA import ─────────────────────────────────────────────────────────────────
+# BUG FIX: must import torch_xla explicitly so torch_xla.device() is accessible.
+# `import torch_xla.core.xla_model as xm` only binds the name `xm`, NOT `torch_xla`.
 try:
+    import torch_xla                                 # ← explicit import needed
     import torch_xla.core.xla_model as xm
     XLA_AVAILABLE = True
 except ImportError:
@@ -36,7 +40,7 @@ def load_tokenizer(path: str = "./leo_tokenizer"):
         tok = PreTrainedTokenizerFast.from_pretrained(path)
         print(f"  Tokenizer : LeoTokenizer (vocab={tok.vocab_size:,})")
         return tok
-    print("  Tokenizer : LeoTokenizer not found — using GPT-2 + Aether tokens")
+    print("  Tokenizer : LeoTokenizer not found — using GPT-2 + Leo tokens")
     tok = AutoTokenizer.from_pretrained("gpt2")
     tok.add_special_tokens({
         "pad_token": "[PAD]",
@@ -89,10 +93,13 @@ class LeoGenerator:
         yarn_scale:  float               = 1.0,
         knowledge_layer                  = None,
     ):
+        # ── device selection ─────────────────────────────────────────────────
         if device:
             self.device = torch.device(device)
         elif XLA_AVAILABLE:
-            self.device = torch_xla.device()
+            # BUG FIX: use xm.xla_device() not torch_xla.device() since
+            # xm is always available; torch_xla.device() is newer API (2.x+).
+            self.device = xm.xla_device()
         elif torch.cuda.is_available():
             self.device = torch.device("cuda")
         else:
@@ -102,7 +109,7 @@ class LeoGenerator:
         self.model = LeoSLM(self.cfg)
 
         if checkpoint and Path(checkpoint).exists():
-            ckpt  = torch.load(checkpoint, map_location=self.device)
+            ckpt  = torch.load(checkpoint, map_location="cpu")  # load to CPU first
             state = ckpt.get("model", ckpt.get("model_state_dict", ckpt))
             state = {
                 k.replace("_orig_mod.", "").replace("module.", ""): v
@@ -119,8 +126,12 @@ class LeoGenerator:
                 print(f"  Checkpoint: NOT FOUND — {checkpoint}")
             print("  Weights   : random (no checkpoint loaded)")
 
-        if self.device.type in ("xla", "cuda"):
+        # Cast to bfloat16 before moving to device for memory efficiency
+        if str(self.device) in ("xla", "cuda") or (
+            hasattr(self.device, "type") and self.device.type in ("xla", "cuda")
+        ):
             self.model = self.model.to(torch.bfloat16)
+
         self.model = self.model.to(self.device)
         self.model.eval()
 
@@ -267,7 +278,6 @@ class LeoGenerator:
 
         think_start = ids.shape[1]
         think_end   = think_ids.shape[1]
-
         think_text  = self.tok.decode(think_ids[0, think_start:think_end], skip_special_tokens=True)
         answer_text = self.tok.decode(ans_ids[0, think_end:],              skip_special_tokens=True)
         full_text   = think_text + "\n\n" + answer_text
@@ -323,19 +333,15 @@ class LeoGenerator:
 
         if mode in ("ar", "nothink"):
             return self._run_ar(ids, max_new_tokens, temperature, top_k, top_p, use_mtp, verbose)
-
         if mode in ("hybrid", "diffusion"):
             return self._run_hybrid(ids, max_new_tokens, temperature, top_k, top_p,
                                     use_mtp, mode, verbose)
-
         if mode == "think":
             return self._run_think(ids, max_new_tokens, temperature, top_k, top_p,
                                    think_budget, use_mtp, verbose)
-
         if mode == "agentic":
             return self._run_agentic(ids, raw_prompt, max_new_tokens, temperature,
                                      top_k, top_p, use_mtp, verbose)
-
         if mode == "auto":
             with torch.no_grad():
                 init = self.model(ids)
