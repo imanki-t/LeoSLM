@@ -1,0 +1,208 @@
+import subprocess, sys, os, shutil, json, warnings
+import numpy as np
+from pathlib import Path
+
+warnings.filterwarnings("ignore")
+
+os.chdir("/kaggle/working/LeoSLM")
+os.makedirs("data",          exist_ok=True)
+os.makedirs("leo_tokenizer", exist_ok=True)
+os.makedirs("checkpoints",   exist_ok=True)
+
+KAGGLE_USERNAME = os.environ.get("KAGGLE_USERNAME", "")
+TRAIN           = Path("./data/train.npy")
+VAL             = Path("./data/val.npy")
+TOK             = Path("./leo_tokenizer/tokenizer.json")
+CKPT_SLUG       = f"{KAGGLE_USERNAME}/leo-checkpoints"
+DATA_SLUG       = f"{KAGGLE_USERNAME}/leo-training-data"
+
+# ── EXPECTED vocab & token IDs (from model/config.py) ─────────────────────────
+EXPECTED_VOCAB    = 65543
+EXPECTED_PAD_ID   = 65529
+EXPECTED_EOS_ID   = 65532
+EXPECTED_THINK_ID = 65535
+
+# ─────────────────────────────────────────────────────────────────────────────
+# STEP 1 — WIPE STALE TOKENIZER AND DATASET
+# ─────────────────────────────────────────────────────────────────────────────
+def is_tokenizer_correct(tok_dir="./leo_tokenizer") -> bool:
+    """Returns True only if the saved tokenizer has correct special token IDs."""
+    tok_path = Path(tok_dir) / "tokenizer.json"
+    if not tok_path.exists():
+        return False
+    try:
+        from transformers import PreTrainedTokenizerFast
+        tok = PreTrainedTokenizerFast.from_pretrained(str(tok_dir))
+        if len(tok) != EXPECTED_VOCAB:
+            return False
+        if tok.convert_tokens_to_ids("[PAD]") != EXPECTED_PAD_ID:
+            return False
+        if tok.convert_tokens_to_ids("[EOS]") != EXPECTED_EOS_ID:
+            return False
+        if tok.convert_tokens_to_ids("<think>") != EXPECTED_THINK_ID:
+            return False
+        return True
+    except Exception:
+        return False
+
+def is_data_correct() -> bool:
+    """Returns True only if train.npy was built with the correct tokenizer."""
+    if not TRAIN.exists() or not VAL.exists():
+        return False
+    try:
+        sample = np.load(str(TRAIN), mmap_mode="r")[:1000]
+        if sample.max() >= EXPECTED_VOCAB:
+            return False
+        if (sample == 3).sum() > 10:
+            print("  Detected old EOS=3 pattern — data is stale")
+            return False
+        return True
+    except Exception:
+        return False
+
+print("=" * 60)
+print("STEP 1 — Checking for stale tokenizer / dataset")
+print("=" * 60)
+
+tok_ok  = is_tokenizer_correct("./leo_tokenizer")
+data_ok = is_data_correct()
+
+if not tok_ok:
+    print("  Stale/missing tokenizer detected — wiping leo_tokenizer/")
+    shutil.rmtree("./leo_tokenizer", ignore_errors=True)
+    os.makedirs("./leo_tokenizer", exist_ok=True)
+
+if not data_ok:
+    print("  Stale/missing dataset detected — wiping data/train.npy + val.npy")
+    for f in ["./data/train.npy", "./data/val.npy", "./data/tokens_tmp.bin", "./data/tok_sample.txt"]:
+        if Path(f).exists():
+            os.remove(f)
+            print(f"    Deleted {f}")
+
+if tok_ok and data_ok:
+    print("  ✓ Tokenizer and dataset look correct — skipping wipe")
+
+# ─────────────────────────────────────────────────────────────────────────────
+# STEP 2 — TRY TO RESTORE CHECKPOINTS FROM KAGGLE DATASET
+# ─────────────────────────────────────────────────────────────────────────────
+print("\n" + "=" * 60)
+print("STEP 2 — Checkpoint restore")
+print("=" * 60)
+
+def kaggle_dataset_exists(slug: str) -> bool:
+    r = subprocess.run(["kaggle", "datasets", "status", slug], capture_output=True, text=True)
+    return r.returncode == 0
+
+def download_and_unzip(slug: str, dest: str) -> bool:
+    os.makedirs(dest, exist_ok=True)
+    r = subprocess.run(["kaggle", "datasets", "download", slug, "--path", dest, "--unzip"], capture_output=True, text=True)
+    return r.returncode == 0
+
+if kaggle_dataset_exists(CKPT_SLUG):
+    print(f"  Downloading checkpoints from {CKPT_SLUG}...")
+    if download_and_unzip(CKPT_SLUG, "./checkpoints"):
+        ckpts = list(Path("./checkpoints").glob("*.pt"))
+        print(f"  ✓ {len(ckpts)} checkpoint(s) restored — training will auto-resume")
+    else:
+        print("  Checkpoint download failed — starting fresh")
+else:
+    print("  No checkpoint dataset yet — starting fresh (session 1)")
+
+# ─────────────────────────────────────────────────────────────────────────────
+# STEP 3 — TRY TO RESTORE TRAINING DATA FROM KAGGLE DATASET
+# ─────────────────────────────────────────────────────────────────────────────
+print("\n" + "=" * 60)
+print("STEP 3 — Training data restore / prep")
+print("=" * 60)
+
+data_restored = False
+if not TRAIN.exists() and kaggle_dataset_exists(DATA_SLUG):
+    print(f"  Downloading training data from {DATA_SLUG} (~8 GB, ~2 min)...")
+    tmp = "/kaggle/working/leo_data_dl"
+    if download_and_unzip(DATA_SLUG, tmp):
+        for f in ["train.npy", "val.npy"]:
+            src = Path(f"{tmp}/data/{f}")
+            dst = Path(f"./data/{f}")
+            if src.exists():
+                shutil.move(str(src), str(dst))
+                print(f"    {f}  ({dst.stat().st_size/1e9:.2f} GB)")
+        
+        # Verify the downloaded tokenizer before replacing the local one
+        tok_src = Path(f"{tmp}/leo_tokenizer")
+        if tok_src.exists():
+            if is_tokenizer_correct(str(tok_src)):
+                shutil.rmtree("./leo_tokenizer", ignore_errors=True)
+                shutil.move(str(tok_src), "./leo_tokenizer")
+                print("    leo_tokenizer restored from dataset")
+            else:
+                print("    Downloaded tokenizer is stale — ignoring it.")
+        
+        shutil.rmtree(tmp, ignore_errors=True)
+        print("  Temp download dir cleaned up")
+        data_restored = is_data_correct()
+        if data_restored:
+            print("  ✓ Data looks correct — skipping prep_data.py")
+    else:
+        print("  Data download failed — will run prep_data.py")
+
+# ─────────────────────────────────────────────────────────────────────────────
+# STEP 4 — RUN prep_data.py IF NEEDED
+# ─────────────────────────────────────────────────────────────────────────────
+if TRAIN.exists() and VAL.exists() and is_tokenizer_correct("./leo_tokenizer"):
+    train_arr = np.load(str(TRAIN), mmap_mode="r")
+    val_arr   = np.load(str(VAL),   mmap_mode="r")
+    print("\n" + "=" * 60)
+    print("Data ready — skipping prep_data.py")
+    print("=" * 60)
+    print(f"  Train : {len(train_arr):,} tokens  ({len(train_arr)*4/1e9:.2f} GB)")
+    print(f"  Val   : {len(val_arr):,}   tokens  ({len(val_arr)*4/1e6:.0f} MB)")
+    print(f"  Vocab : {EXPECTED_VOCAB:,} ✓")
+else:
+    print("\n" + "=" * 60)
+    print("Running full data prep — ~5 hours (you can close this tab)")
+    print("=" * 60)
+
+    result = subprocess.run(
+        [sys.executable, "prep_data.py", "--fast"],
+        env={**os.environ},
+        cwd="/kaggle/working/LeoSLM",
+    )
+
+    if result.returncode != 0:
+        print("prep_data.py failed — scroll up for error")
+        raise RuntimeError("Data prep failed — cannot continue")
+
+    if not is_tokenizer_correct("./leo_tokenizer"):
+        raise RuntimeError("Tokenizer still wrong after prep_data.py! Check output.")
+    if not is_data_correct():
+        raise RuntimeError("Dataset still looks wrong after prep_data.py! Check output.")
+
+    print("\n✓ Data prep complete and verified")
+
+    SAVE_DIR = "/kaggle/working/leo_data_save"
+    os.makedirs(f"{SAVE_DIR}/data",          exist_ok=True)
+    os.makedirs(f"{SAVE_DIR}/leo_tokenizer", exist_ok=True)
+
+    for f in ["train.npy", "val.npy"]:
+        src = Path(f"./data/{f}")
+        dst = Path(f"{SAVE_DIR}/data/{f}")
+        if src.exists() and not dst.exists():
+            shutil.copy2(str(src), str(dst))
+
+    if Path("./leo_tokenizer").exists():
+        shutil.copytree("./leo_tokenizer", f"{SAVE_DIR}/leo_tokenizer", dirs_exist_ok=True)
+
+    Path(f"{SAVE_DIR}/dataset-metadata.json").write_text(json.dumps({
+        "title":    "leo-training-data",
+        "id":       f"{KAGGLE_USERNAME}/leo-training-data",
+        "licenses": [{"name": "CC0-1.0"}],
+    }))
+
+    r = subprocess.run(["kaggle", "datasets", "create", "-p", SAVE_DIR, "--dir-mode", "zip"], capture_output=True, text=True)
+    if r.returncode == 0:
+        print(f"leo-training-data pushed → future sessions auto-download it")
+    else:
+        subprocess.run(["kaggle", "datasets", "version", "-p", SAVE_DIR, "-m", "data prep complete", "--dir-mode", "zip"], capture_output=True, text=True)
+        print("leo-training-data updated on Kaggle")
+
+print("\n✓ Cell 3 complete — ready to train")
