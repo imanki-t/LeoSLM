@@ -1,0 +1,307 @@
+import subprocess, sys, os, shutil, json, warnings
+import numpy as np
+from pathlib import Path
+
+warnings.filterwarnings("ignore")
+
+os.chdir("/kaggle/working/LeoSLM")
+os.makedirs("data",          exist_ok=True)
+os.makedirs("leo_tokenizer", exist_ok=True)
+os.makedirs("checkpoints",   exist_ok=True)
+
+KAGGLE_USERNAME = os.environ.get("KAGGLE_USERNAME", "")
+TRAIN           = Path("./data/train.npy")
+VAL             = Path("./data/val.npy")
+TOK_JSON        = Path("./leo_tokenizer/tokenizer.json")
+CKPT_SLUG       = f"{KAGGLE_USERNAME}/leo-checkpoints"
+
+# v3: 65k vocab (correct IDs) + 2B tokens
+# v1: old 65k (EOS=3, wrong)
+# v2: fixed 65k + 1B tokens
+# v3: fixed 65k + 2B tokens — new name guarantees never downloads stale data
+DATA_DATASET_NAME = "leo-training-data-v3"
+DATA_SLUG         = f"{KAGGLE_USERNAME}/{DATA_DATASET_NAME}"
+
+# Must match model/config.py LeoConfig and prep_data.py exactly
+EXPECTED_VOCAB    = 65543
+EXPECTED_PAD_ID   = 65529
+EXPECTED_EOS_ID   = 65532
+EXPECTED_THINK_ID = 65535
+
+
+# ── Helpers ───────────────────────────────────────────────────────────────────
+
+def check_disk_space(warn_gb=6.0):
+    _, used, free = shutil.disk_usage("/kaggle/working")
+    free_gb = free / 1e9
+    print(f"  Disk free: {free_gb:.1f} GB  |  used: {used/1e9:.1f} GB")
+    if free_gb < warn_gb:
+        print(f"  WARNING: under {warn_gb}GB free!")
+    return free_gb
+
+
+def wipe_tmp_files():
+    """Delete the large intermediate file and sample — frees ~8GB."""
+    freed = 0.0
+    for f in ["./data/tokens_tmp.bin", "./data/tok_sample.txt"]:
+        p = Path(f)
+        if p.exists():
+            size_gb = p.stat().st_size / 1e9
+            p.unlink()
+            print(f"  Deleted {f} ({size_gb:.2f} GB freed)")
+            freed += size_gb
+    if freed == 0:
+        print("  No temp files found")
+    return freed
+
+
+def kaggle_dataset_exists(slug: str) -> bool:
+    r = subprocess.run(["kaggle", "datasets", "status", slug],
+                       capture_output=True, text=True)
+    return r.returncode == 0
+
+
+def download_and_unzip(slug: str, dest: str) -> bool:
+    os.makedirs(dest, exist_ok=True)
+    r = subprocess.run(
+        ["kaggle", "datasets", "download", slug, "--path", dest, "--unzip"],
+        capture_output=True, text=True,
+    )
+    return r.returncode == 0
+
+
+def tokenizer_is_correct() -> bool:
+    if not TOK_JSON.exists():
+        return False
+    try:
+        from transformers import PreTrainedTokenizerFast
+        tok = PreTrainedTokenizerFast.from_pretrained("./leo_tokenizer")
+        if len(tok) != EXPECTED_VOCAB:
+            print(f"  Tokenizer vocab: {len(tok):,} != {EXPECTED_VOCAB:,}")
+            return False
+        if tok.convert_tokens_to_ids("[PAD]")   != EXPECTED_PAD_ID:
+            return False
+        if tok.convert_tokens_to_ids("[EOS]")   != EXPECTED_EOS_ID:
+            return False
+        if tok.convert_tokens_to_ids("<think>") != EXPECTED_THINK_ID:
+            return False
+        return True
+    except Exception as e:
+        print(f"  Tokenizer check error: {e}")
+        return False
+
+
+def data_is_correct() -> bool:
+    if not TRAIN.exists() or not VAL.exists():
+        return False
+    try:
+        sample = np.load(str(TRAIN), mmap_mode="r")[:2000]
+        if sample.max() >= EXPECTED_VOCAB:
+            print(f"  Data out of range: max={sample.max()} >= {EXPECTED_VOCAB}")
+            return False
+        # Old broken tokenizer fingerprints
+        if (sample == 3).sum() > 20:
+            print("  Stale: EOS=3 fingerprint (very old tokenizer)")
+            return False
+        return True
+    except Exception as e:
+        print(f"  Data check error: {e}")
+        return False
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# STEP 0 — Disk space check + wipe leftover temp files from any failed runs
+# ─────────────────────────────────────────────────────────────────────────────
+print("=" * 60)
+print("STEP 0 — Disk space + temp file cleanup")
+print("=" * 60)
+check_disk_space(warn_gb=6.0)
+print("\n  Wiping any leftover temp files from previous runs...")
+wipe_tmp_files()
+print()
+check_disk_space()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# STEP 1 — Wipe stale local tokenizer and dataset
+# ─────────────────────────────────────────────────────────────────────────────
+print("\n" + "=" * 60)
+print("STEP 1 — Check and wipe stale local files")
+print("=" * 60)
+
+tok_ok  = tokenizer_is_correct()
+data_ok = data_is_correct()
+
+if not tok_ok:
+    print("  Tokenizer wrong/missing → wiping ./leo_tokenizer/")
+    shutil.rmtree("./leo_tokenizer", ignore_errors=True)
+    os.makedirs("./leo_tokenizer", exist_ok=True)
+else:
+    print(f"  ✓ Tokenizer correct  (vocab={EXPECTED_VOCAB:,}, PAD={EXPECTED_PAD_ID}, EOS={EXPECTED_EOS_ID})")
+
+if not data_ok:
+    print("  Dataset stale/missing → wiping data/*.npy")
+    for f in ["./data/train.npy", "./data/val.npy"]:
+        p = Path(f)
+        if p.exists():
+            size_gb = p.stat().st_size / 1e9
+            p.unlink()
+            print(f"    Deleted {f} ({size_gb:.2f} GB freed)")
+else:
+    # Check data is 2B not 1B (v2 had 1B)
+    try:
+        arr = np.load(str(TRAIN), mmap_mode="r")
+        n_tokens = len(arr)
+        if n_tokens < 1_800_000_000:   # less than 1.8B = probably old 1B dataset
+            print(f"  Dataset too small: {n_tokens/1e9:.2f}B tokens (need ~2B)")
+            print("  Wiping to force fresh 2B run...")
+            data_ok = False
+            for f in ["./data/train.npy", "./data/val.npy"]:
+                Path(f).unlink(missing_ok=True)
+            print("  Wiped old dataset")
+        else:
+            print(f"  ✓ Dataset correct  ({n_tokens/1e9:.2f}B tokens)")
+    except Exception:
+        data_ok = False
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# STEP 2 — Restore checkpoints
+# ─────────────────────────────────────────────────────────────────────────────
+print("\n" + "=" * 60)
+print("STEP 2 — Checkpoint restore")
+print("=" * 60)
+
+if kaggle_dataset_exists(CKPT_SLUG):
+    print(f"  Downloading from {CKPT_SLUG}...")
+    ok = download_and_unzip(CKPT_SLUG, "./checkpoints")
+    if ok:
+        ckpts = list(Path("./checkpoints").glob("*.pt"))
+        print(f"  ✓ {len(ckpts)} checkpoint(s) restored")
+    else:
+        print("  Download failed — starting fresh")
+else:
+    print("  No checkpoint dataset yet — Phase 1 from scratch")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# STEP 3 — Download correct data from leo-training-data-v3
+# ─────────────────────────────────────────────────────────────────────────────
+print("\n" + "=" * 60)
+print(f"STEP 3 — Training data: {DATA_DATASET_NAME}")
+print("=" * 60)
+
+data_restored = False
+if not TRAIN.exists() and kaggle_dataset_exists(DATA_SLUG):
+    print(f"  Downloading from {DATA_SLUG} (~8 GB, ~2 min)...")
+    tmp = "/kaggle/working/leo_data_dl"
+    ok  = download_and_unzip(DATA_SLUG, tmp)
+    if ok:
+        for f in ["train.npy", "val.npy"]:
+            src = Path(f"{tmp}/data/{f}")
+            dst = Path(f"./data/{f}")
+            if src.exists():
+                shutil.move(str(src), str(dst))
+                print(f"    {f}  ({dst.stat().st_size / 1e9:.2f} GB)")
+        tok_src = Path(f"{tmp}/leo_tokenizer")
+        if tok_src.exists() and not tokenizer_is_correct():
+            shutil.rmtree("./leo_tokenizer", ignore_errors=True)
+            shutil.move(str(tok_src), "./leo_tokenizer")
+            print("    leo_tokenizer restored from dataset")
+        shutil.rmtree(tmp, ignore_errors=True)
+        data_restored = data_is_correct() and tokenizer_is_correct()
+        if data_restored:
+            print("  ✓ Downloaded data verified correct")
+        else:
+            print("  Downloaded data failed verification — will re-run prep_data.py")
+            for f in ["./data/train.npy", "./data/val.npy"]:
+                Path(f).unlink(missing_ok=True)
+            shutil.rmtree("./leo_tokenizer", ignore_errors=True)
+            os.makedirs("./leo_tokenizer", exist_ok=True)
+elif not TRAIN.exists():
+    print(f"  {DATA_DATASET_NAME} not on Kaggle yet — running prep_data.py")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# STEP 4 — Run prep_data.py if still needed
+# ─────────────────────────────────────────────────────────────────────────────
+if TRAIN.exists() and VAL.exists() and tokenizer_is_correct():
+    train_arr = np.load(str(TRAIN), mmap_mode="r")
+    val_arr   = np.load(str(VAL),   mmap_mode="r")
+    print("\n✓ Data ready — skipping prep_data.py")
+    print(f"  Train : {len(train_arr):,} tokens  ({len(train_arr) * 4 / 1e9:.2f} GB)")
+    print(f"  Val   : {len(val_arr):,} tokens  ({len(val_arr) * 4 / 1e6:.0f} MB)")
+    print(f"  Vocab : {EXPECTED_VOCAB:,} ✓")
+    print(f"  PAD={EXPECTED_PAD_ID}  EOS={EXPECTED_EOS_ID}  THINK={EXPECTED_THINK_ID} ✓")
+
+else:
+    print("\n" + "=" * 60)
+    print("Running data prep — 2B tokens | 65k vocab")
+    print("~3-4 hours. Close tab anytime — data pushes to Kaggle after.")
+    print("=" * 60)
+    check_disk_space(warn_gb=6.0)
+
+    result = subprocess.run(
+        [sys.executable, "prep_data.py"],   # full 2B run — no --fast
+        env={**os.environ},
+        cwd="/kaggle/working/LeoSLM",
+    )
+
+    # Always wipe tmp files after prep (prep_data.py does it too — belt+braces)
+    print("\n  Post-prep cleanup...")
+    wipe_tmp_files()
+
+    if result.returncode != 0:
+        raise RuntimeError("prep_data.py failed — scroll up for the error")
+
+    if not tokenizer_is_correct():
+        raise RuntimeError(
+            f"Tokenizer wrong after prep! "
+            f"Expected vocab={EXPECTED_VOCAB:,} PAD={EXPECTED_PAD_ID} EOS={EXPECTED_EOS_ID}"
+        )
+    if not data_is_correct():
+        raise RuntimeError("Dataset wrong after prep! Check output above.")
+
+    print("\n✓ Data prep complete and verified")
+    check_disk_space()
+
+    # ── Push to leo-training-data-v3 ──────────────────────────────────────────
+    SAVE_DIR = "/kaggle/working/leo_data_save"
+    os.makedirs(f"{SAVE_DIR}/data",          exist_ok=True)
+    os.makedirs(f"{SAVE_DIR}/leo_tokenizer", exist_ok=True)
+
+    for f in ["train.npy", "val.npy"]:
+        src = Path(f"./data/{f}")
+        dst = Path(f"{SAVE_DIR}/data/{f}")
+        if src.exists() and not dst.exists():
+            shutil.copy2(str(src), str(dst))
+            print(f"  Copied {f} → save dir")
+
+    if Path("./leo_tokenizer").exists():
+        shutil.copytree("./leo_tokenizer", f"{SAVE_DIR}/leo_tokenizer",
+                        dirs_exist_ok=True)
+
+    Path(f"{SAVE_DIR}/dataset-metadata.json").write_text(json.dumps({
+        "title":    DATA_DATASET_NAME,
+        "id":       f"{KAGGLE_USERNAME}/{DATA_DATASET_NAME}",
+        "licenses": [{"name": "CC0-1.0"}],
+    }))
+
+    r = subprocess.run(
+        ["kaggle", "datasets", "version", "-p", SAVE_DIR,
+         "-m", "2B tokens 65k vocab v3", "--dir-mode", "zip"],
+        capture_output=True, text=True,
+    )
+    if r.returncode != 0:
+        r = subprocess.run(
+            ["kaggle", "datasets", "create", "-p", SAVE_DIR, "--dir-mode", "zip"],
+            capture_output=True, text=True,
+        )
+
+    if r.returncode == 0:
+        print(f"\n✓ Pushed → kaggle.com/datasets/{KAGGLE_USERNAME}/{DATA_DATASET_NAME}")
+        print("  Future sessions download this automatically — no re-prep needed")
+    else:
+        print(f"  Kaggle push note: {r.stderr[:200]}")
+
+print("\n✓ Cell 3 complete — ready to train")
