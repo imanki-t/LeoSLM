@@ -1,10 +1,22 @@
 """
-model/config.py — LeoSLM Aether configuration
+model/config.py  —  LeoSLM Aether  (~1B parameters)
 
-CHANGE vs original:
-  - Added `use_gradient_checkpointing: bool = False` field.
-    Set to True via --grad_ckpt CLI flag or leo_slm.enable_gradient_checkpointing().
-    Saves ~70% HBM at ~30% compute overhead — critical for 32k context on v5e-8.
+Architecture changes from 3.1B original:
+  hidden_dim:      2560  →  1792   (fits 14 heads × 128 head_dim exactly)
+  num_layers:        32  →    24   (2 dense + 22 MoE)
+  num_heads:         20  →    14
+  num_dense_layers:   4  →     2
+  mla_c_kv:         512  →   384
+  mla_c_q:          768  →   512
+  ffn_dim_dense:   6912  →  4864
+  ffn_dim_expert:  1024  →   512
+  tdm_memory_size:   64  →    32
+  sam_memory_size:   32  →    16
+  mtp_n:              4  →     3
+
+Total params:  ~950M (~1B)
+Checkpoint:    ~1.9 GB BF16
+Vocab/IDs:     unchanged (65543, PAD=65529, EOS=65532, etc.)
 """
 
 from dataclasses import dataclass
@@ -13,7 +25,7 @@ from typing import Optional
 
 @dataclass
 class LeoConfig:
-    # ── Vocabulary / Special tokens ────────────────────────────────────────────
+    # ── Vocabulary + special tokens (unchanged) ───────────────────────────────
     vocab_size:        int   = 65543
     pad_id:            int   = 65529
     bos_id:            int   = 65531
@@ -29,53 +41,49 @@ class LeoConfig:
     system_start:      int   = 65541
     estr_domain_count: int   = 8
 
-    # ── Sequence ───────────────────────────────────────────────────────────────
+    # ── Sequence ──────────────────────────────────────────────────────────────
     max_seq_len:       int   = 32768
     chunk_size:        int   = 2048
     think_budget_max:  int   = 8192
     think_budget_min:  int   = 256
 
-    # ── Core dimensions ────────────────────────────────────────────────────────
-    hidden_dim:        int   = 2560
-    num_layers:        int   = 32
-    num_dense_layers:  int   = 4
-    num_heads:         int   = 20
-    head_dim:          int   = 128       # hidden_dim / num_heads = 128
+    # ── Core dimensions (REDUCED for ~1B) ────────────────────────────────────
+    hidden_dim:        int   = 1792   # was 2560 — 14 heads × 128 = 1792 exactly
+    num_layers:        int   = 24     # was 32
+    num_dense_layers:  int   = 2      # was 4
+    num_heads:         int   = 14     # was 20
+    head_dim:          int   = 128    # unchanged — 1792/14 = 128 ✓
 
-    # ── MLA ───────────────────────────────────────────────────────────────────
+    # ── MLA (REDUCED) ────────────────────────────────────────────────────────
     use_mla:           bool  = True
-    mla_c_kv:          int   = 512
-    mla_c_q:           int   = 768
-    mla_rope_dim:      int   = 64
+    mla_c_kv:          int   = 384    # was 512
+    mla_c_q:           int   = 512    # was 768
+    mla_rope_dim:      int   = 64     # unchanged
 
-    # ── Sliding window ────────────────────────────────────────────────────────
-    sliding_window:    int   = 4096
-    global_every_n:    int   = 4
-
-    # ── DSA ───────────────────────────────────────────────────────────────────
+    # ── Attention pattern ─────────────────────────────────────────────────────
+    sliding_window:    int   = 4096   # unchanged
+    global_every_n:    int   = 4      # unchanged (layers 3,7,11,... are global)
     use_dsa:           bool  = True
     dsa_threshold:     int   = 32768
     dsa_top_k_pct:     float = 0.25
+    num_kv_heads:      int   = 4      # GQA fallback
 
-    # ── GQA fallback ──────────────────────────────────────────────────────────
-    num_kv_heads:      int   = 4
-
-    # ── FFN ───────────────────────────────────────────────────────────────────
-    ffn_dim_dense:     int   = 6912
-    ffn_dim_expert:    int   = 1024
+    # ── FFN dimensions (REDUCED) ──────────────────────────────────────────────
+    ffn_dim_dense:     int   = 4864   # was 6912
+    ffn_dim_expert:    int   = 512    # was 1024
 
     # ── MoE ───────────────────────────────────────────────────────────────────
-    moe_experts:       int   = 8
-    moe_top_k:         int   = 2
-    moe_shared:        int   = 1
+    moe_experts:       int   = 8      # unchanged
+    moe_top_k:         int   = 2      # unchanged
+    moe_shared:        int   = 1      # unchanged
     moe_load_coeff:    float = 0.01
     uwmr_spec_scale:   float = 2.0
     uwmr_gen_scale:    float = 1.0
 
     # ── ECT ───────────────────────────────────────────────────────────────────
-    num_ect:           int   = 8
-    ect_heads:         int   = 4
-    ect_max:           int   = 16
+    num_ect:           int   = 6      # was 8 (small saving)
+    ect_heads:         int   = 4      # unchanged
+    ect_max:           int   = 12     # was 16
     ect_spawn_thresh:  float = 0.60
 
     # ── ACGI ──────────────────────────────────────────────────────────────────
@@ -92,21 +100,23 @@ class LeoConfig:
 
     # ── PRM ───────────────────────────────────────────────────────────────────
     use_prm:           bool  = True
-    prm_hidden:        int   = 256
+    prm_hidden:        int   = 128    # was 256 (small model → smaller PRM head)
+
+    # ── TTIP ──────────────────────────────────────────────────────────────────
     use_ttip:          bool  = True
 
-    # ── MTP ───────────────────────────────────────────────────────────────────
+    # ── MTP (REDUCED) ────────────────────────────────────────────────────────
     use_mtp:           bool  = True
-    mtp_n:             int   = 4
+    mtp_n:             int   = 3      # was 4
     mtp_head_layers:   int   = 1
 
-    # ── SAM ───────────────────────────────────────────────────────────────────
+    # ── SAM (REDUCED) ────────────────────────────────────────────────────────
     use_sam:           bool  = True
-    sam_memory_size:   int   = 32
+    sam_memory_size:   int   = 16     # was 32
 
-    # ── TDM ───────────────────────────────────────────────────────────────────
+    # ── TDM (REDUCED) ────────────────────────────────────────────────────────
     use_tdm:           bool  = True
-    tdm_memory_size:   int   = 64
+    tdm_memory_size:   int   = 32     # was 64
     tdm_conf_threshold: float = 0.20
     cmg_threshold:     float = 0.7
 
@@ -118,12 +128,10 @@ class LeoConfig:
     # ── Uncertainty ───────────────────────────────────────────────────────────
     uncertainty_thresh: float = 0.50
 
-    # ── Gradient checkpointing (NEW) ──────────────────────────────────────────
-    # Set via train.py --grad_ckpt flag or model.enable_gradient_checkpointing().
-    # Reduces HBM usage ~70% at ~30% extra compute. Recommended for 32k+ context.
-    use_gradient_checkpointing: bool = False
+    # ── Gradient checkpointing ────────────────────────────────────────────────
+    use_gradient_checkpointing: bool = False   # set True via --grad_ckpt flag
 
-    # ── Loss weights ──────────────────────────────────────────────────────────
+    # ── Loss weights ─────────────────────────────────────────────────────────
     loss_w_ect:  float = 0.10
     loss_w_moe:  float = 0.01
     loss_w_idk:  float = 0.10
