@@ -1,60 +1,72 @@
 # ╔═══════════════════════════════════════════════════════════════════════════════╗
-# ║              LeoSLM "Aether"  —  FRONTIER CLASS  |  Built by Unmuted        ║
+# ║              LeoSLM "Aether"  —  1B CLASS  |  Built by Unmuted              ║
 # ╠═══════════════════════════════════════════════════════════════════════════════╣
 # ║  Hardware   : Kaggle TPU v5e-8  | 128 GB HBM | ~1,576 TFLOPS BF16          ║
-# ║  Model      : ~3.1B total | ~1.9B active (MoE top-2/8) | BF16              ║
+# ║  Model      : ~950M total | ~220M active (MoE top-2/8) | BF16              ║
 # ║  Context    : 32,768 trained | 131,072 via YaRN at inference                ║
-# ║  Data       : 2.1B tokens | 6 sources | LeoTokenizer (65,543 vocab)        ║
+# ║  Data       : 2B tokens | 6 sources | LeoTokenizer (65,543 vocab)          ║
 # ║  Framework  : PyTorch/XLA + xmp.spawn (8 workers) + Adafactor              ║
 # ╠═══════════════════════════════════════════════════════════════════════════════╣
-# ║  COMPETITION TARGET: Claude Haiku 4.5 / Gemini 2.5 Flash Lite              ║
+# ║  WHY 1B NOT 3.1B:                                                            ║
+# ║  Chinchilla optimal ratio = 20 tokens/param.                                ║
+# ║  2B tokens → optimal model = 100M params (inference-optimal).               ║
+# ║  1B model on 2B tokens = 2 tok/param — undertrained but functional.         ║
+# ║  3.1B on 2B tokens = 0.65 tok/param — severely undertrained, won't converge.║
+# ║  A 1B model also trains faster, has a 1.9GB checkpoint, and runs on 8GB GPU.║
+# ╠═══════════════════════════════════════════════════════════════════════════════╣
+# ║  DISK BUDGET (19.5 GB limit):                                                ║
+# ║  tokens_tmp.bin during prep:    8.00 GB                                      ║
+# ║  train.npy (peak overlap):      7.76 GB  →  peak total: 15.76 GB ✓          ║
+# ║  val.npy:                       0.24 GB                                      ║
+# ║  checkpoint (1B BF16):          1.90 GB                                      ║
+# ║  code + tokenizer:              0.35 GB                                      ║
+# ║  Total at training:            10.25 GB  →  9.25 GB headroom ✓              ║
 # ╚═══════════════════════════════════════════════════════════════════════════════╝
 #
 # NOTE: This file is documentation + leo_rag.py config only.
-#       train.py / model code use model/config.py (Python dataclass) directly.
-#       All field names here are kept in sync with LeoConfig for clarity.
+# train.py and model code read model/config.py directly.
+# All field names here match LeoConfig dataclass exactly.
 
 # ───────────────────────────────────────────────────────────────────────────────
-# TOKENIZER — LeoTokenizer (custom BPE, not GPT-2)
+# TOKENIZER
 # ───────────────────────────────────────────────────────────────────────────────
-# FIX: vocab_size was 65536 — wrong. Correct value is 65543.
-# prep_data.py trains BPE with base_vocab=65529 (IDs 0..65528), then
-# add_special_tokens() appends 14 specials at IDs 65529..65542 → total 65543.
+# WHY 65k NOT 256k for a 1B model:
+# 256k vocab → embedding table = 256000 × 1792 = 459M params = 48% of model budget
+# 65k vocab  → embedding table =  65543 × 1792 = 117M params = 12% of model budget
+# At 1B scale, wasting half the params on lookup tables is a bad trade.
+# 256k vocab makes sense at 7B+ where the embedding is a smaller fraction.
 tokenizer:
   type:           bpe
-  vocab_size:     65543            # 65529 base BPE + 14 special tokens = 65543
-  base_bpe_vocab: 65529            # BpeTrainer target (NO specials in trainer)
+  vocab_size:     65543          # 65529 base BPE + 14 specials = 65543
+  base_bpe_vocab: 65529
   train_data:     ./data/tok_sample.txt
   digit_tokens:   true
   number_tokens:  true
-  # Special tokens — appended AFTER BPE training via add_special_tokens()
-  # IDs are APPENDED sequentially starting at base_bpe_vocab (65529)
   special_tokens:
-    pad:              "[PAD]"          # 65529  ← cfg.pad_id
-    unk:              "[UNK]"          # 65530  ← cfg.unk_id (not in LeoConfig but tokenizer needs it)
-    bos:              "[BOS]"          # 65531  ← cfg.bos_id
-    eos:              "[EOS]"          # 65532  ← cfg.eos_id
-    mask:             "[MASK]"         # 65533  ← cfg.mask_id
-    idk:              "[IDK]"          # 65534  ← cfg.idk_id
-    think_start:      "<think>"        # 65535  ← cfg.think_start_id
-    think_end:        "</think>"       # 65536  ← cfg.think_end_id
-    tool_call_start:  "<|tool_call|>"  # 65537  ← cfg.tool_call_start
-    tool_call_end:    "<|/tool_call|>" # 65538  ← cfg.tool_call_end
-    tool_result_start:"<|tool_result|>"# 65539  ← cfg.tool_result_start
-    tool_result_end:  "<|/tool_result|>"# 65540 ← cfg.tool_result_end
-    system_start:     "<|system|>"     # 65541  ← cfg.system_start
-    system_end:       "<|/system|>"    # 65542  ← closing tag
+    pad:              "[PAD]"           # 65529  ← cfg.pad_id
+    unk:              "[UNK]"           # 65530
+    bos:              "[BOS]"           # 65531  ← cfg.bos_id
+    eos:              "[EOS]"           # 65532  ← cfg.eos_id
+    mask:             "[MASK]"          # 65533  ← cfg.mask_id
+    idk:              "[IDK]"           # 65534  ← cfg.idk_id
+    think_start:      "<think>"         # 65535  ← cfg.think_start_id
+    think_end:        "</think>"        # 65536  ← cfg.think_end_id
+    tool_call_start:  "<|tool_call|>"   # 65537  ← cfg.tool_call_start
+    tool_call_end:    "<|/tool_call|>"  # 65538  ← cfg.tool_call_end
+    tool_result_start:"<|tool_result|>" # 65539  ← cfg.tool_result_start
+    tool_result_end:  "<|/tool_result|>"# 65540  ← cfg.tool_result_end
+    system_start:     "<|system|>"      # 65541  ← cfg.system_start
+    system_end:       "<|/system|>"     # 65542
 
 # ───────────────────────────────────────────────────────────────────────────────
-# MODEL ARCHITECTURE
+# MODEL ARCHITECTURE  (~1B params)
 # ───────────────────────────────────────────────────────────────────────────────
-# ALL field names below match model/config.py LeoConfig dataclass exactly.
 model:
-  name:    LeoSLM-Aether
+  name:    LeoSLM-Aether-1B
   version: aether
   creator: Unmuted
 
-  # Special token IDs — must match tokenizer section above
+  # Special token IDs (unchanged from 65k tokenizer)
   pad_id:            65529
   bos_id:            65531
   eos_id:            65532
@@ -69,125 +81,115 @@ model:
   system_start:      65541
   estr_domain_count: 8
 
-  vocab_size:   65543          # = 65529 base + 14 specials
+  vocab_size:   65543
 
-  # ── Sequence ──────────────────────────────────────────────────────────────────
+  # ── Sequence ──────────────────────────────────────────────────────────────
   max_seq_len:       32768
   chunk_size:        2048
   think_budget_max:  8192
   think_budget_min:  256
 
-  # ── Core dimensions ───────────────────────────────────────────────────────────
-  hidden_dim:       2560
-  num_layers:       32
-  num_dense_layers: 4
-  num_heads:        20
-  head_dim:         128        # hidden_dim / num_heads = 128 ✓
+  # ── Core dimensions (REDUCED from 3.1B → ~1B) ────────────────────────────
+  # Key constraint: hidden_dim must be divisible by num_heads
+  # 1792 / 14 = 128 (head_dim) ✓
+  hidden_dim:       1792   # was 2560
+  num_layers:       24     # was 32
+  num_dense_layers: 2      # was 4
+  num_heads:        14     # was 20
+  head_dim:         128    # unchanged — 1792/14 = 128 exactly
 
-  # ── Multi-Head Latent Attention (MLA) ─────────────────────────────────────────
+  # ── MLA (REDUCED) ────────────────────────────────────────────────────────
   use_mla:      true
-  mla_c_kv:     512
-  mla_c_q:      768
-  mla_rope_dim: 64
+  mla_c_kv:     384         # was 512
+  mla_c_q:      512         # was 768
+  mla_rope_dim: 64          # unchanged
 
-  # ── Hybrid attention: Sliding Window + Global ─────────────────────────────────
-  # FIX: was sliding_window_size — correct field name is sliding_window
-  sliding_window: 4096         # local layers attend ±4096 tokens
-  global_every_n: 4            # every 4th layer is global (layers 3,7,11,...31)
+  # ── Hybrid attention ──────────────────────────────────────────────────────
+  sliding_window: 4096
+  global_every_n: 4
 
-  # ── GQA fallback ──────────────────────────────────────────────────────────────
+  # ── GQA fallback ──────────────────────────────────────────────────────────
   num_kv_heads: 4
 
-  # ── FFN dimensions ────────────────────────────────────────────────────────────
-  ffn_dim_dense:  6912
-  ffn_dim_expert: 1024
+  # ── FFN (REDUCED) ─────────────────────────────────────────────────────────
+  ffn_dim_dense:  4864      # was 6912  (≈ 8/3 × 1792, aligned to 64)
+  ffn_dim_expert: 512       # was 1024
 
-  # ── Mixture of Experts (UWMR) ─────────────────────────────────────────────────
-  # FIX: moe_num_experts → moe_experts, moe_shared_experts → moe_shared
-  moe_experts:   8             # total expert count
-  moe_top_k:     2             # active experts per token
-  moe_shared:    1             # always-active shared expert (DeepSeek-style)
+  # ── MoE ───────────────────────────────────────────────────────────────────
+  moe_experts:    8         # unchanged
+  moe_top_k:      2         # unchanged
+  moe_shared:     1         # unchanged
   moe_load_coeff: 0.01
+  uwmr_spec_scale: 2.0
+  uwmr_gen_scale:  1.0
 
-  # FIX: uwmr_specialist_scale → uwmr_spec_scale, uwmr_generalist_scale → uwmr_gen_scale
-  uwmr_spec_scale: 2.0         # routing bias for high-U (uncertain) tokens
-  uwmr_gen_scale:  1.0         # routing bias for low-U (confident) tokens
-
-  # ── ECT v3 ────────────────────────────────────────────────────────────────────
-  num_ect:   8
-  ect_heads: 4
-  # FIX: ect_max_total → ect_max, ect_spawn_threshold → ect_spawn_thresh
-  ect_max:          16
+  # ── ECT (REDUCED) ────────────────────────────────────────────────────────
+  num_ect:          6       # was 8
+  ect_heads:        4
+  ect_max:          12      # was 16
   ect_spawn_thresh: 0.60
 
-  # ── Deep Think Mode ───────────────────────────────────────────────────────────
-  deep_think:
-    enabled:               true
-    auto_think_threshold:  0.50
-    grpo_format_reward:    1.0
-    grpo_accuracy_reward:  2.0
-    grpo_factuality_reward: 1.5
-    grpo_length_penalty:   0.001
-    use_prm:               true
-    prm_hidden:            256
+  # ── ACGI ──────────────────────────────────────────────────────────────────
+  acgi_threshold:    0.72
 
-  # ── EPE ───────────────────────────────────────────────────────────────────────
+  # ── EPE ───────────────────────────────────────────────────────────────────
   use_epe:       true
   epe_min_scale: 0.7
   epe_max_scale: 1.8
 
-  # ── YaRN ──────────────────────────────────────────────────────────────────────
-  use_yarn:  true
-  yarn_scale: 1.0              # set >1.0 at inference for extended context
+  # ── YaRN ──────────────────────────────────────────────────────────────────
+  use_yarn:   true
+  yarn_scale: 1.0
   yarn:
-    scale_factor: 4.0          # 32k × 4 = 128k at inference
+    scale_factor: 4.0
     beta_fast:    32
     beta_slow:    1
     mscale:       0.1
 
-  # ── MTP ───────────────────────────────────────────────────────────────────────
+  # ── MTP (REDUCED) ────────────────────────────────────────────────────────
   use_mtp:         true
-  mtp_n:           4
+  mtp_n:           3        # was 4
   mtp_head_layers: 1
 
-  # ── DSA ───────────────────────────────────────────────────────────────────────
+  # ── DSA ───────────────────────────────────────────────────────────────────
   use_dsa:       true
   dsa_threshold: 32768
   dsa_top_k_pct: 0.25
 
-  # ── ACGI ──────────────────────────────────────────────────────────────────────
-  acgi_threshold:    0.72
-
-  # ── SAM ───────────────────────────────────────────────────────────────────────
+  # ── SAM (REDUCED) ────────────────────────────────────────────────────────
   use_sam:         true
-  sam_memory_size: 32
+  sam_memory_size: 16       # was 32
 
-  # ── TDM ───────────────────────────────────────────────────────────────────────
+  # ── TDM (REDUCED) ────────────────────────────────────────────────────────
   use_tdm:             true
-  tdm_memory_size:     64
+  tdm_memory_size:     32   # was 64
   tdm_conf_threshold:  0.20
   cmg_threshold:       0.7
 
-  # ── TTIP ──────────────────────────────────────────────────────────────────────
-  use_ttip: true
-
-  # ── PRM ───────────────────────────────────────────────────────────────────────
+  # ── PRM (REDUCED head) ────────────────────────────────────────────────────
   use_prm:    true
-  prm_hidden: 256
+  prm_hidden: 128           # was 256
 
-  # ── CUR ───────────────────────────────────────────────────────────────────────
-  use_cur:       true
+  # ── CUR ───────────────────────────────────────────────────────────────────
+  use_cur:        true
   cur_max_passes: 3
   cur_threshold:  0.05
 
-  # ── Uncertainty threshold ──────────────────────────────────────────────────────
-  # FIX: was uncertainty_threshold: 0.35 — WRONG NAME AND VALUE
-  # Correct field name: uncertainty_thresh, correct value: 0.50
+  # ── TTIP ──────────────────────────────────────────────────────────────────
+  use_ttip: true
+
+  # ── Uncertainty ───────────────────────────────────────────────────────────
   uncertainty_thresh: 0.50
 
-  # ── Gradient checkpointing ────────────────────────────────────────────────────
-  # Enabled via --grad_ckpt flag in train.py (reduces HBM ~70%)
-  use_gradient_checkpointing: false   # set true via --grad_ckpt CLI flag
+  # ── Loss weights ─────────────────────────────────────────────────────────
+  loss_w_ect:  0.10
+  loss_w_moe:  0.01
+  loss_w_idk:  0.10
+  loss_w_ses:  0.01
+  loss_w_mtp:  0.30
+  loss_w_prm:  0.05
+  loss_w_acgi: 0.10
+  loss_w_msra: 0.05
 
 # ───────────────────────────────────────────────────────────────────────────────
 # ANTI-HALLUCINATION STACK
@@ -212,15 +214,6 @@ anti_hallucination:
 # TRAINING — 8 phases
 # ───────────────────────────────────────────────────────────────────────────────
 training:
-  # Phase schedule (matches train.py PHASE_CFG exactly)
-  # Phase 1: AR warmup          4k ctx
-  # Phase 2: Diffusion          8k ctx
-  # Phase 3: Full MoE+ECT+MTP  16k ctx
-  # Phase 4: SFT alignment     32k ctx
-  # Phase 5: Factuality DPO    32k ctx
-  # Phase 6: GRPO Think RL     32k ctx
-  # Phase 7: Agentic SFT       32k ctx
-  # Phase 8: Agentic RL        32k ctx
   phase1_epochs: 2
   phase2_epochs: 2
   phase3_epochs: 2
@@ -233,35 +226,28 @@ training:
   phase_contexts: [4096, 8192, 16384, 32768, 32768, 32768, 32768, 32768]
   phase_tau:      [0.50,  0.45,  0.40,  0.35,  0.35,  0.30,  0.30,  0.28]
 
-  # ── Optimizer ──────────────────────────────────────────────────────────────────
   optimizer:     adafactor
-  lr:            1.0e-3
-  lr_min:        1.0e-4
+  lr:            1.2e-3      # slightly higher LR for smaller model
+  lr_min:        1.2e-4
   weight_decay:  0.1
   grad_clip:     1.0
   warmup_steps:  1000
 
-  # ── Batch ──────────────────────────────────────────────────────────────────────
-  # Memory per chip at 32k context with xmp.spawn + grad checkpointing:
-  #   Params BF16:           3.1B × 2B           ≈  6.2 GB
-  #   Adafactor 2nd moment:  row-factored         ≈  1.5 GB
-  #   Activations (ckpt):                        ≈  1.2 GB
-  #   XLA workspace:                             ≈  1.0 GB
-  #   ─────────────────────────────────────────────────────
-  #   Total:                                     ≈  9.9 GB / 16 GB  ✓
-  batch_size:       1      # 1 full sequence per chip per step
-  grad_accumulation: 16   # effective batch: 1 × 16 × 8 chips = 128 sequences
+  # Memory at 32k context with 1B model + grad checkpointing:
+  #   Params BF16:           1B × 2B     ≈  2.0 GB/chip
+  #   Adafactor moments:     row-factored ≈  0.8 GB/chip
+  #   Activations (ckpt):                ≈  0.6 GB/chip
+  #   XLA workspace:                     ≈  1.0 GB/chip
+  #   ──────────────────────────────────────────────────
+  #   Total:                             ≈  4.4 GB / 16 GB  ✓ (28% utilisation)
+  batch_size:       1
+  grad_accumulation: 16      # effective batch = 1 × 16 × 8 chips = 128 seqs
 
-  # ── Memory ──────────────────────────────────────────────────────────────────────
-  mixed_precision:         true    # BF16 (TPU native)
-  gradient_checkpointing:  true    # per-block recompute, enabled via --grad_ckpt
-  # FIX: use_fsdp was true — FSDP was root cause of hlo_verifier crash
-  # Now using xmp.spawn (8 workers, one per chip) with xm.optimizer_step
-  use_fsdp:  false
-  use_spmd:  false
+  mixed_precision:         true
+  gradient_checkpointing:  true
+  use_fsdp:                false   # xmp.spawn handles distribution
+  use_spmd:                false
 
-  # ── Loss weights ─────────────────────────────────────────────────────────────
-  # Field names match training/loss.py LeoLoss exactly
   loss_w_ect:  0.10
   loss_w_moe:  0.01
   loss_w_idk:  0.10
@@ -271,7 +257,6 @@ training:
   loss_w_acgi: 0.10
   loss_w_msra: 0.05
 
-  # ── GRPO (Phase 6) ────────────────────────────────────────────────────────────
   grpo:
     n_samples:    8
     kl_coeff:     0.001
@@ -280,29 +265,32 @@ training:
     temperature:  1.0
     reward_model: rule
 
-  # ── Checkpointing ─────────────────────────────────────────────────────────────
   save_every_steps: 200
   eval_every_steps: 200
   checkpoint_dir:   ./checkpoints
 
 # ───────────────────────────────────────────────────────────────────────────────
-# DATA
+# DATA  —  2B tokens
 # ───────────────────────────────────────────────────────────────────────────────
+# Token/param ratio: 2B / 1B = 2 tok/param
+# Chinchilla optimal would be 20B tokens for 1B params.
+# 2 tok/param = undertrained but produces a functional, useful model.
+# (LLaMA, Phi, Mistral all "overtrain" small models well past Chinchilla.)
 data:
   train_path: ./data/train.npy
   val_path:   ./data/val.npy
   tok_path:   ./data/tok_sample.txt
-  dtype:      uint32             # uint32 required: vocab IDs up to 65543 > uint16 max
+  dtype:      uint32
   tokenizer:  ./leo_tokenizer/
 
   sources:
-    fineweb_edu:   700_000_000
-    finemath:      300_000_000
-    the_stack:     400_000_000
-    open_web_math: 200_000_000
-    dolma_books:   300_000_000
-    dolma_wiki:    200_000_000
-  total_tokens: 2_100_000_000
+    fineweb_edu:   1_200_000_000   # 60%
+    finemath:        300_000_000   # 15%
+    the_stack:       260_000_000   # 13%
+    open_web_math:   120_000_000   #  6%
+    dolma_books:      80_000_000   #  4%
+    dolma_wiki:       40_000_000   #  2%
+  total_tokens: 2_000_000_000
 
 # ───────────────────────────────────────────────────────────────────────────────
 # INFERENCE
@@ -311,39 +299,30 @@ inference:
   temperature:  0.8
   top_k:        50
   top_p:        0.9
-
   default_mode:      auto
   think_trigger:     "/think"
   nothink_trigger:   "/nothink"
-
   use_yarn:     true
-  yarn_max_len: 131072           # 128k tokens at inference via YaRN ×4
-
+  yarn_max_len: 131072
   use_cur:         true
   cur_max_passes:  3
   cur_threshold:   0.05
-
   use_tdm:         true
-  tdm_memory_size: 64
+  tdm_memory_size: 32
   tdm_threshold:   0.20
-
   use_kv_cache:       true
   kv_evict_uncertain: true
   kv_max_length:      32768
-
   use_ect_spawn:    true
   ect_spawn_thresh: 0.60
-
   use_contrastive:   false
   contrastive_alpha: 0.1
-
   consistency_votes:  3
   consistency_thresh: 0.70
 
 # ───────────────────────────────────────────────────────────────────────────────
-# TPU v5e-8 HARDWARE
+# TPU v5e-8
 # ───────────────────────────────────────────────────────────────────────────────
-# FIX: use_fsdp removed, XLA_FLAGS GPU flag removed
 tpu:
   num_chips:       8
   hbm_per_chip_gb: 16
@@ -351,55 +330,40 @@ tpu:
   tflops_bf16:     1576
   dtype:           bfloat16
   framework:       pytorch_xla
-  training_mode:   xmp_spawn    # xmp.spawn(8 workers) — correct Kaggle TPU pattern
-  use_fsdp:        false        # FIX: was true — caused hlo_verifier crash
-  use_compile:     false        # XLA JIT handles compilation natively
+  training_mode:   torch_xla.launch
+  use_fsdp:        false
+  use_compile:     false
   xla_jit:         true
-  num_workers:     0            # must be 0 on Kaggle TPU (fork issues)
+  num_workers:     0
   env:
     PJRT_DEVICE:                  "TPU"
     XLA_TENSOR_ALLOCATOR_MAXSIZE: "1000000000"
     TF_CPP_MIN_LOG_LEVEL:         "3"
-    # FIX: removed XLA_FLAGS --xla_gpu_enable_triton_gemm (GPU-only flag, wrong on TPU)
-    # FIX: removed XLA_USE_BF16 (deprecated, model uses .to(torch.bfloat16) instead)
 
 # ───────────────────────────────────────────────────────────────────────────────
-# LEO IDENTITY
+# IDENTITY
 # ───────────────────────────────────────────────────────────────────────────────
 identity:
   name:      Leo
   full_name: Leo Aether
   creator:   Unmuted
-  version:   aether
-  description: >
-    Leo is a small language model built by Unmuted.
-    Leo uses a Confidence-Gated Diffusion-AR Transformer architecture with
-    Epistemic Confidence Tokens that architecturally constrain hallucination.
-    Leo can think step-by-step, call tools, search the web, and use MCP servers.
-    Leo was trained on 2.1B tokens across education, math, code, books, and Wikipedia.
-  personality: >
-    Direct, honest, curious, and calibrated.
-    Leo acknowledges uncertainty rather than confabulating.
-    Leo enjoys reasoning inside its think blocks.
-    Leo knows it was built by Unmuted and says so.
+  version:   aether-1b
   system_prompt: >
     You are Leo, a language model built by Unmuted. Your full name is Leo Aether.
-    You have approximately 3.1 billion parameters and were trained on 2.1 billion tokens.
+    You have approximately 1 billion parameters and were trained on 2 billion tokens.
     You use a Confidence-Gated Diffusion-AR Transformer with Epistemic Confidence Tokens.
     You can call tools including web search, code execution, and MCP servers.
     When uncertain, say so or use your think mode. Never claim to be GPT, Claude, or Gemini.
 
 # ───────────────────────────────────────────────────────────────────────────────
-# EXTERNAL KNOWLEDGE + RAG + CUSTOM INSTRUCTIONS
+# EXTERNAL KNOWLEDGE
 # ───────────────────────────────────────────────────────────────────────────────
 external_knowledge:
-  enabled: false       # flip to true after training to activate RAG / tools
-
+  enabled: false
   custom_instructions:
     enabled: false
     path:    ./knowledge/instructions.txt
     inline:  null
-
   rag:
     enabled:     false
     backend:     chroma
@@ -407,18 +371,15 @@ external_knowledge:
     collection:  leo_knowledge
     top_k:       5
     max_tokens:  2048
-    similarity:  cosine
     embed_model: sentence-transformers/all-MiniLM-L6-v2
     api_url:     null
     api_key:     null
-
   document_store:
     enabled:        false
     source_dir:     ./knowledge/documents/
     chunk_size:     512
     chunk_overlap:  64
     supported_types: [pdf, txt, md, html, docx, json, csv]
-
   mcp_servers:
     - name: web_search
       enabled: false
@@ -436,7 +397,6 @@ external_knowledge:
       enabled: false
       url:  null
       auth: null
-
   custom_functions:
     enabled:  false
     registry: ./knowledge/functions.json
